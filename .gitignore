@@ -1,0 +1,11 @@
+# Build artifacts
+/bin/
+
+# Secrets and local runtime state — never commit these
+.env
+drive-config.json
+search.db
+
+# Frontend
+/web/node_modules/
+/web/dist/
