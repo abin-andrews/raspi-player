@@ -1,0 +1,18 @@
+[Unit]
+Description=pi-streamer network audio player daemon
+After=network-online.target mpd.service
+Wants=network-online.target mpd.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__WORKDIR__
+ExecStart=__EXEC__
+Restart=on-failure
+RestartSec=2
+# Optional — only loaded if it exists; matches `make run`'s .env auto-load
+# for any future secrets. None are currently required.
+EnvironmentFile=-__WORKDIR__/.env
+
+[Install]
+WantedBy=multi-user.target

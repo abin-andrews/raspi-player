@@ -12,7 +12,7 @@ PI_HOST    ?= pi@raspberrypi.local
 PI_PATH    ?= ~/pi-streamer
 
 .PHONY: all build run dev test fmt vet lint clean \
-	build-pi build-pi64 build-all deploy-pi deploy-pi64 \
+	build-pi build-pi64 build-all deploy-pi deploy-pi64 install-deps-pi \
 	build-indexer run-indexer \
 	web-install web-build web-test \
 	install-deps help
@@ -65,11 +65,21 @@ build-pi64:
 
 build-all: build build-pi build-pi64
 
-deploy-pi: build-pi
-	scp $(BIN_DIR)/$(BINARY)-arm $(PI_HOST):$(PI_PATH)
+# Ships the binary + built frontend to the Pi over SSH/SCP and installs a
+# systemd service (deploy/pi-streamer.service.tmpl) so it runs on boot and
+# restarts on crash — see scripts/deploy-pi.sh for exactly what it does.
+# Needs sudo on the Pi (to install the systemd unit) and mpd already set up
+# there (make install-deps-pi + the audio_output config in CLAUDE.md).
+deploy-pi: build-pi web-build
+	PI_HOST=$(PI_HOST) PI_PATH=$(PI_PATH) ./scripts/deploy-pi.sh arm
 
-deploy-pi64: build-pi64
-	scp $(BIN_DIR)/$(BINARY)-arm64 $(PI_HOST):$(PI_PATH)
+deploy-pi64: build-pi64 web-build
+	PI_HOST=$(PI_HOST) PI_PATH=$(PI_PATH) ./scripts/deploy-pi.sh arm64
+
+# One-time Pi-side package setup (mpd/mpc) — audio_output still needs a
+# manual edit to /etc/mpd.conf afterwards (hardware-specific, see CLAUDE.md).
+install-deps-pi:
+	ssh $(PI_HOST) 'sudo apt-get update && sudo apt-get install -y mpd mpc'
 
 ## Search indexer (runs on a separate, more capable machine — not the Pi)
 
@@ -95,5 +105,6 @@ help:
 	@echo "x86:       make build | make run | make dev (indexer+daemon+frontend together, Ctrl+C stops all)"
 	@echo "Pi (32-bit armhf):  make build-pi   | make deploy-pi   (PI_HOST=$(PI_HOST))"
 	@echo "Pi (64-bit arm64):  make build-pi64 | make deploy-pi64 (PI_HOST=$(PI_HOST))"
+	@echo "Pi setup:  make install-deps-pi (mpd/mpc via apt on PI_HOST)"
 	@echo "Indexer:   make build-indexer | make run-indexer"
 	@echo "Frontend:  make web-install | make web-build | make web-test"

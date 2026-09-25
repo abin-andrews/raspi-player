@@ -20,9 +20,70 @@ type OLED struct {
 	Baud int    `json:"baud"`
 }
 
+// PlaybackMode selects how a submitted URL is actually handed to mpd.
+type PlaybackMode string
+
+const (
+	// ModeStream is the original behavior: mpd streams the remote URL
+	// directly, after a cheap reachability check (internal/urlcheck).
+	ModeStream PlaybackMode = "stream"
+	// ModeBucket downloads the URL into the local bucket cache first
+	// (internal/bucket) and hands mpd the resulting local file path —
+	// more robust against a flaky remote server mid-playback, at the
+	// cost of a startup delay while the download completes.
+	ModeBucket PlaybackMode = "bucket"
+)
+
+// AllowedModes are the only valid values for Bucket.Mode. The empty string
+// (an unconfigured Config's zero value) is treated as ModeStream, not
+// listed here since it's never what a client should explicitly send.
+var AllowedModes = []PlaybackMode{ModeStream, ModeBucket}
+
+// IsAllowedMode reports whether mode is one of AllowedModes.
+func IsAllowedMode(mode PlaybackMode) bool {
+	for _, m := range AllowedModes {
+		if m == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// Defaults applied whenever the corresponding Bucket field is zero (an
+// unconfigured Config, or one predating that field).
+const (
+	DefaultBucketMaxSizeMB    = 512  // the evictable playback cache
+	DefaultFavoritesMaxSizeMB = 1024 // the permanent favorites archive
+	DefaultMinFreeMB          = 512  // safety margin, shared by both
+)
+
+// Bucket holds the local audio-file cache's settings — see internal/bucket.
+// Two independent stores share this section: the evictable playback cache
+// (Mode/MaxSizeMB) and the permanent favorites archive (FavoritesMaxSizeMB)
+// — favoriting a track never counts against the playback cache's cap, but
+// it does have its own ceiling, since "permanent" still shouldn't mean
+// "unbounded": once it's full, saving a new favorite fails outright rather
+// than evicting an existing one (see internal/bucket.Store's evictable
+// flag). MinFreeMB is a disk-space safety margin both stores independently
+// refuse to cross, regardless of their own caps.
+type Bucket struct {
+	Mode      PlaybackMode `json:"mode"`
+	MaxSizeMB int          `json:"maxSizeMb"`
+	// FavoritesMaxSizeMB caps the permanent favorites archive. Zero means
+	// DefaultFavoritesMaxSizeMB.
+	FavoritesMaxSizeMB int `json:"favoritesMaxSizeMb"`
+	// MinFreeMB is the minimum free disk space (on the filesystem holding
+	// both stores) either one will leave itself. Zero means
+	// DefaultMinFreeMB — there is no "0 disables the margin" option;
+	// disabling it isn't offered since it makes it too easy to fill an SD
+	// card solid.
+	MinFreeMB int `json:"minFreeMb"`
+}
+
 // Config is the full set of daemon settings persisted to disk.
 type Config struct {
-	OLED OLED `json:"oled"`
+	OLED   OLED   `json:"oled"`
+	Bucket Bucket `json:"bucket"`
 }
 
 // AllowedBauds are the serial baud rates the daemon will accept for the

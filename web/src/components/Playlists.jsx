@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import {
   Alert,
   Button,
@@ -182,4 +182,6 @@ function Playlists() {
   )
 }
 
-export default Playlists
+// Memoized: takes no props from App, so it shouldn't re-render on the
+// once-a-second status ticks that flow through the tree while playing.
+export default memo(Playlists)

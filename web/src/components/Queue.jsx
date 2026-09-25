@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import {
   ActionIcon,
   Alert,
@@ -10,6 +10,7 @@ import {
   Text,
   TextInput,
 } from '@mantine/core'
+import { notifications } from '@mantine/notifications'
 import {
   IconChevronDown,
   IconChevronUp,
@@ -27,18 +28,60 @@ import {
   removeFromQueue,
 } from '../api.js'
 import { formatTime } from '../format.js'
+import { useCachedUrls } from '../hooks/useCachedUrls.js'
+
+// How long a freshly-added row stays visually highlighted after Add to
+// Queue succeeds — long enough to catch the eye, short enough not to
+// linger and look like a stuck/error state.
+const HIGHLIGHT_MS = 3000
 
 function Queue({ status }) {
   const [queue, setQueue] = useState([])
   const [url, setUrl] = useState('')
   const [error, setError] = useState(null)
+  const [adding, setAdding] = useState(false)
+  const [highlightId, setHighlightId] = useState(null)
+  const cached = useCachedUrls(queue.map((t) => t.url))
+  const rowRefs = useRef({})
+  // Stable per-track-id ref callbacks (created once, reused across
+  // renders) — an inline `ref={(el) => ...}` arrow function is a *new*
+  // function every render, and React treats a changed ref-callback
+  // identity as "detach the old one, attach the new one," so every row's
+  // DOM ref was being torn down and rebuilt on every single render. That
+  // was invisible functionally (rowRefs.current ended up correct either
+  // way) but was pure churn — and this component used to re-render every
+  // second purely from the status prop ticking (see the memo comparator
+  // on this component's export), so it added up to a lot of pointless
+  // work over a long playback session.
+  const rowRefCallbacks = useRef({})
+  function rowRef(id) {
+    if (!rowRefCallbacks.current[id]) {
+      rowRefCallbacks.current[id] = (el) => {
+        if (el) rowRefs.current[id] = el
+        else delete rowRefs.current[id]
+      }
+    }
+    return rowRefCallbacks.current[id]
+  }
+
+  // Prune stale entries once the queue itself changes, so a long session
+  // with many tracks added/removed over time doesn't leave an ever-growing
+  // set of unused per-id callback closures sitting in rowRefCallbacks.
+  useEffect(() => {
+    const liveIds = new Set(queue.map((t) => t.id))
+    for (const id of Object.keys(rowRefCallbacks.current)) {
+      if (!liveIds.has(Number(id))) delete rowRefCallbacks.current[id]
+    }
+  }, [queue])
 
   async function refresh() {
     try {
       const q = await getQueue()
       setQueue(q ?? [])
+      return q ?? []
     } catch (err) {
       setError(err.message)
+      return []
     }
   }
 
@@ -46,15 +89,42 @@ function Queue({ status }) {
     refresh()
   }, [])
 
+  // Scroll the just-added row into view as soon as it's rendered, so a
+  // track appended to the end of a long queue doesn't silently land
+  // off-screen with no visible confirmation it was added.
+  useEffect(() => {
+    if (highlightId == null) return
+    rowRefs.current[highlightId]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    const timer = setTimeout(() => setHighlightId(null), HIGHLIGHT_MS)
+    return () => clearTimeout(timer)
+  }, [highlightId])
+
   async function handleAdd() {
-    if (!url.trim()) return
+    const submitted = url.trim()
+    if (!submitted || adding) return
     setError(null)
+    setAdding(true)
     try {
-      await addToQueue(url.trim())
+      await addToQueue(submitted)
       setUrl('')
-      await refresh()
+      const q = await refresh()
+      const sortedNow = [...q].sort((a, b) => a.position - b.position)
+      // mpd appends new adds to the end of the queue, so the last entry
+      // once sorted by position is the one that was just added.
+      const added = sortedNow[sortedNow.length - 1]
+      notifications.show({
+        color: 'green',
+        title: 'Added to queue',
+        message: added?.title || added?.url || submitted,
+      })
+      if (added) {
+        setHighlightId(added.id)
+      }
     } catch (err) {
       setError(err.message)
+      notifications.show({ color: 'red', title: 'Could not add to queue', message: err.message })
+    } finally {
+      setAdding(false)
     }
   }
 
@@ -115,9 +185,16 @@ function Queue({ status }) {
           placeholder="https://example.com/stream.mp3"
           value={url}
           onChange={(e) => setUrl(e.currentTarget.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+          disabled={adding}
           style={{ flex: 1 }}
         />
-        <Button onClick={handleAdd} disabled={!url.trim()} leftSection={<IconPlus size={16} />}>
+        <Button
+          onClick={handleAdd}
+          loading={adding}
+          disabled={!url.trim()}
+          leftSection={<IconPlus size={16} />}
+        >
           Add to Queue
         </Button>
         <Button
@@ -139,16 +216,22 @@ function Queue({ status }) {
         )}
         {sorted.map((track, i) => {
           const isPlaying = track.id === status?.songId
+          const isHighlighted = track.id === highlightId
           return (
             <Card
               key={track.id}
+              ref={rowRef(track.id)}
               withBorder
               padding="sm"
-              style={
-                isPlaying
+              style={{
+                transition: 'background-color 0.6s ease, border-left-color 0.6s ease',
+                backgroundColor: isHighlighted
+                  ? 'var(--mantine-color-green-light)'
+                  : undefined,
+                ...(isPlaying
                   ? { borderLeft: '3px solid var(--mantine-color-blue-6)' }
-                  : undefined
-              }
+                  : undefined),
+              }}
             >
               <Group justify="space-between" wrap="nowrap">
                 <Stack gap={0} style={{ minWidth: 0 }}>
@@ -159,6 +242,11 @@ function Queue({ status }) {
                     {isPlaying && (
                       <Badge size="xs" color="blue" variant="light">
                         Now Playing
+                      </Badge>
+                    )}
+                    {cached[track.url] && (
+                      <Badge size="xs" color="teal" variant="light">
+                        Cached
                       </Badge>
                     )}
                   </Group>
@@ -216,4 +304,11 @@ function Queue({ status }) {
   )
 }
 
-export default Queue
+// Memoized with a custom comparator: this component only ever reads
+// status.songId (to highlight the currently-playing row) — not
+// elapsed/duration — so without this it was re-rendering, re-sorting the
+// queue, and rebuilding every row's DOM every single second while
+// something played, for no visible benefit at all. Now it only re-renders
+// on an actual song change (plus, as with any component, its own internal
+// state changes — memo only gates re-renders triggered by the parent).
+export default memo(Queue, (prev, next) => prev.status?.songId === next.status?.songId)

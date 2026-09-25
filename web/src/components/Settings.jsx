@@ -1,32 +1,66 @@
 import { useEffect, useState } from 'react'
-import { Alert, Badge, Button, Group, Select, Stack, Text, Title } from '@mantine/core'
+import {
+  Alert,
+  Badge,
+  Button,
+  Group,
+  NumberInput,
+  Progress,
+  Select,
+  Stack,
+  Text,
+  Title,
+} from '@mantine/core'
 import { IconRefresh } from '@tabler/icons-react'
-import { getConfig, getOledBauds, getOledPorts, getOledStatus, reloadConfig, setConfig } from '../api.js'
+import {
+  getBucketStatus,
+  getConfig,
+  getOledBauds,
+  getOledPorts,
+  getOledStatus,
+  reloadConfig,
+  setConfig,
+} from '../api.js'
+import { formatBytes } from '../format.js'
 
 const DEFAULT_BAUD = 115200
+const MODE_DATA = [
+  { value: 'stream', label: 'Stream directly' },
+  { value: 'bucket', label: 'Download to bucket, then stream' },
+]
 
-// Settings currently only covers the OLED display, but talks to the
-// general-purpose /api/config endpoints (internal/config) so more settings
-// can be added here later without a new mechanism.
+// Settings talks to the general-purpose /api/config endpoints
+// (internal/config) — currently the OLED display and the local audio
+// bucket, but more can be added here later without a new mechanism.
+// PUT /api/config replaces the whole object, not a per-section patch, so
+// the single Save button below always sends every field currently in the
+// form (both sections), not just whichever one the user was looking at.
 //
-// Both dropdowns (port, baud) are populated from the backend rather than
-// free text — the backend rejects anything else anyway (internal/api's
-// validateOLED), so offering only valid choices avoids a round-trip just to
-// find out a typed value was rejected.
+// Port/baud/mode dropdowns are populated from the backend rather than free
+// text — the backend rejects anything else anyway (internal/api's
+// validateOLED/validateBucket), so offering only valid choices avoids a
+// round-trip just to find out a typed value was rejected.
 function Settings() {
   const [port, setPort] = useState('')
   const [baud, setBaud] = useState(String(DEFAULT_BAUD))
   const [ports, setPorts] = useState([])
   const [bauds, setBauds] = useState([])
-  const [status, setStatus] = useState(null)
+  const [oledStatus, setOledStatus] = useState(null)
   const [loadingPorts, setLoadingPorts] = useState(false)
+
+  const [mode, setMode] = useState('stream')
+  const [maxSizeMb, setMaxSizeMb] = useState('')
+  const [favoritesMaxSizeMb, setFavoritesMaxSizeMb] = useState('')
+  const [minFreeMb, setMinFreeMb] = useState('')
+  const [bucketStatus, setBucketStatus] = useState(null)
+
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(false)
   const [error, setError] = useState(null)
 
-  async function refreshStatus() {
+  async function refreshOledStatus() {
     try {
-      setStatus(await getOledStatus())
+      setOledStatus(await getOledStatus())
     } catch (err) {
       setError(err.message)
     }
@@ -43,9 +77,21 @@ function Settings() {
     }
   }
 
+  async function refreshBucketStatus() {
+    try {
+      setBucketStatus(await getBucketStatus())
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
   function applyConfig(cfg) {
     setPort(cfg?.oled?.port ?? '')
     setBaud(String(cfg?.oled?.baud || DEFAULT_BAUD))
+    setMode(cfg?.bucket?.mode || 'stream')
+    setMaxSizeMb(cfg?.bucket?.maxSizeMb ? String(cfg.bucket.maxSizeMb) : '')
+    setFavoritesMaxSizeMb(cfg?.bucket?.favoritesMaxSizeMb ? String(cfg.bucket.favoritesMaxSizeMb) : '')
+    setMinFreeMb(cfg?.bucket?.minFreeMb ? String(cfg.bucket.minFreeMb) : '')
   }
 
   useEffect(() => {
@@ -58,7 +104,8 @@ function Settings() {
     }
     load()
     refreshPorts()
-    refreshStatus()
+    refreshOledStatus()
+    refreshBucketStatus()
     getOledBauds()
       .then((b) => setBauds(b ?? []))
       .catch((err) => setError(err.message))
@@ -68,8 +115,16 @@ function Settings() {
     setError(null)
     setSaving(true)
     try {
-      await setConfig({ oled: { port, baud: Number(baud) } })
-      await refreshStatus()
+      await setConfig({
+        oled: { port, baud: Number(baud) },
+        bucket: {
+          mode,
+          maxSizeMb: Number(maxSizeMb) || 0,
+          favoritesMaxSizeMb: Number(favoritesMaxSizeMb) || 0,
+          minFreeMb: Number(minFreeMb) || 0,
+        },
+      })
+      await Promise.all([refreshOledStatus(), refreshBucketStatus()])
     } catch (err) {
       setError(err.message)
     } finally {
@@ -82,7 +137,7 @@ function Settings() {
     setReloading(true)
     try {
       applyConfig(await reloadConfig())
-      await refreshStatus()
+      await Promise.all([refreshOledStatus(), refreshBucketStatus()])
     } catch (err) {
       setError(err.message)
     } finally {
@@ -106,8 +161,8 @@ function Settings() {
 
       <Title order={5}>OLED Display</Title>
       <Text size="sm" c="dimmed">
-        Drives the Arduino display over USB serial (see arduino/control.ino). Saved to the
-        daemon's config.json and connects immediately — no restart needed.
+        Drives the Arduino display over USB serial (see arduino/control.ino). Connects
+        immediately on Save — no restart needed.
       </Text>
 
       <Group align="flex-end">
@@ -137,32 +192,113 @@ function Settings() {
         style={{ maxWidth: 200 }}
       />
 
-      <Group>
+      {oledStatus && (
+        <Group gap="xs">
+          <Badge color={oledStatus.connected ? 'green' : 'gray'}>
+            {oledStatus.connected ? 'Connected' : 'Disconnected'}
+          </Badge>
+          {oledStatus.port && (
+            <Text size="sm" c="dimmed">
+              {oledStatus.port} @ {oledStatus.baud} baud
+            </Text>
+          )}
+          {oledStatus.error && (
+            <Text size="sm" c="red">
+              {oledStatus.error}
+            </Text>
+          )}
+        </Group>
+      )}
+
+      <Title order={5} mt="md">
+        Audio Bucket
+      </Title>
+      <Text size="sm" c="dimmed">
+        "Stream directly" plays a URL as-is (after a quick reachability check). "Download to
+        bucket" downloads it locally first, then hands the local file to mpd — more robust
+        against a flaky remote server mid-playback. The bucket cache evicts your
+        least-recently-played tracks once it hits its size limit; favorited tracks are saved
+        separately and permanently instead (never auto-deleted), up to their own limit. A
+        safety margin always keeps some space free on the SD card regardless of either limit.
+      </Text>
+
+      <Select
+        label="Playback mode"
+        data={MODE_DATA}
+        value={mode}
+        onChange={(value) => setMode(value ?? 'stream')}
+        style={{ maxWidth: 320 }}
+      />
+
+      <Group grow>
+        <NumberInput
+          label="Bucket cache limit (MB)"
+          description="Evictable — oldest-played tracks removed to make room"
+          placeholder="512"
+          min={0}
+          value={maxSizeMb}
+          onChange={(v) => setMaxSizeMb(v === '' ? '' : String(v))}
+        />
+        <NumberInput
+          label="Favorites storage limit (MB)"
+          description="Permanent — full means new favorites can't be saved, not that old ones get deleted"
+          placeholder="1024"
+          min={0}
+          value={favoritesMaxSizeMb}
+          onChange={(v) => setFavoritesMaxSizeMb(v === '' ? '' : String(v))}
+        />
+        <NumberInput
+          label="Safety margin (MB)"
+          description="Minimum free disk space either store will always leave"
+          placeholder="512"
+          min={0}
+          value={minFreeMb}
+          onChange={(v) => setMinFreeMb(v === '' ? '' : String(v))}
+        />
+      </Group>
+
+      {bucketStatus && (
+        <Stack gap={4}>
+          <Group justify="space-between">
+            <Text size="sm">Bucket cache</Text>
+            <Text size="sm" c="dimmed">
+              {formatBytes(bucketStatus.usedBytes)} / {formatBytes(bucketStatus.maxBytes)}
+            </Text>
+          </Group>
+          <Progress
+            value={bucketStatus.maxBytes ? (100 * bucketStatus.usedBytes) / bucketStatus.maxBytes : 0}
+            size="sm"
+          />
+          <Group justify="space-between" mt="xs">
+            <Text size="sm">Favorites archive</Text>
+            <Text size="sm" c="dimmed">
+              {formatBytes(bucketStatus.favoritesUsedBytes)} / {formatBytes(bucketStatus.favoritesMaxBytes)}
+            </Text>
+          </Group>
+          <Progress
+            value={
+              bucketStatus.favoritesMaxBytes
+                ? (100 * bucketStatus.favoritesUsedBytes) / bucketStatus.favoritesMaxBytes
+                : 0
+            }
+            size="sm"
+            color="grape"
+          />
+          <Text size="xs" c="dimmed" mt="xs">
+            Disk free: {formatBytes(bucketStatus.diskFreeBytes)} (margin:{' '}
+            {formatBytes(bucketStatus.minFreeBytes)})
+          </Text>
+        </Stack>
+      )}
+
+      <Group mt="md">
         <Button onClick={handleSave} loading={saving}>
-          Save &amp; Connect
+          Save Settings
         </Button>
         <Button variant="light" onClick={handleReload} loading={reloading}>
           Reload from file
         </Button>
       </Group>
-
-      {status && (
-        <Group gap="xs">
-          <Badge color={status.connected ? 'green' : 'gray'}>
-            {status.connected ? 'Connected' : 'Disconnected'}
-          </Badge>
-          {status.port && (
-            <Text size="sm" c="dimmed">
-              {status.port} @ {status.baud} baud
-            </Text>
-          )}
-          {status.error && (
-            <Text size="sm" c="red">
-              {status.error}
-            </Text>
-          )}
-        </Group>
-      )}
     </Stack>
   )
 }

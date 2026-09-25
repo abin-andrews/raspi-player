@@ -1,13 +1,15 @@
-import { useEffect, useState } from 'react'
-import { ActionIcon, Alert, Button, Card, Group, Stack, Text, TextInput } from '@mantine/core'
+import { memo, useEffect, useState } from 'react'
+import { ActionIcon, Alert, Badge, Button, Card, Group, Stack, Text, TextInput } from '@mantine/core'
 import { IconPlayerPlay, IconPlus, IconTrash } from '@tabler/icons-react'
 import { addFavorite, listFavorites, playURL, removeFavorite } from '../api.js'
+import { useCachedUrls } from '../hooks/useCachedUrls.js'
 
 function Favorites() {
   const [favorites, setFavorites] = useState([])
   const [url, setUrl] = useState('')
   const [title, setTitle] = useState('')
   const [error, setError] = useState(null)
+  const cached = useCachedUrls(favorites.map((f) => f.url))
 
   async function refresh() {
     try {
@@ -91,9 +93,16 @@ function Favorites() {
           <Card key={f.url} withBorder padding="sm">
             <Group justify="space-between" wrap="nowrap">
               <Stack gap={0} style={{ minWidth: 0 }}>
-                <Text fw={500} truncate="end">
-                  {f.title || f.url}
-                </Text>
+                <Group gap="xs" wrap="nowrap">
+                  <Text fw={500} truncate="end">
+                    {f.title || f.url}
+                  </Text>
+                  {cached[f.url] && (
+                    <Badge size="xs" color="teal" variant="light">
+                      Saved offline
+                    </Badge>
+                  )}
+                </Group>
                 {f.title && (
                   <Text size="xs" c="dimmed" truncate="end">
                     {f.url}
@@ -121,4 +130,6 @@ function Favorites() {
   )
 }
 
-export default Favorites
+// Memoized: takes no props from App, so it shouldn't re-render on the
+// once-a-second status ticks that flow through the tree while playing.
+export default memo(Favorites)

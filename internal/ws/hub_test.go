@@ -157,3 +157,33 @@ func TestNewRegisteredClientWithNoInitialMessage(t *testing.T) {
 		t.Fatal("timed out waiting for broadcast message")
 	}
 }
+
+func TestNewRegisteredClientReceivesMultipleInitialMessagesInOrder(t *testing.T) {
+	h := NewHub()
+	// Multiplexing more than one kind of state (e.g. status + bucket
+	// download progress) onto one connection means more than one initial
+	// snapshot may need queuing for a newly connecting client — each
+	// non-empty one, in order, strictly before any later broadcast.
+	c := h.newRegisteredClient([]byte("status-snapshot"), nil, []byte("downloads-snapshot"))
+
+	for _, want := range []string{"status-snapshot", "downloads-snapshot"} {
+		select {
+		case got := <-c.send:
+			if string(got) != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for initial message %q", want)
+		}
+	}
+
+	h.Broadcast([]byte("later"))
+	select {
+	case got := <-c.send:
+		if string(got) != "later" {
+			t.Fatalf("got %q, want %q", got, "later")
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for broadcast message")
+	}
+}

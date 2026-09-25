@@ -394,6 +394,29 @@ func handleSearch(p Player) http.HandlerFunc {
 	}
 }
 
+func handleLibrary(p Player) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		limit := 0
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil {
+				limit = n
+			}
+		}
+		offset := 0
+		if o := r.URL.Query().Get("offset"); o != "" {
+			if n, err := strconv.Atoi(o); err == nil {
+				offset = n
+			}
+		}
+		results, err := p.Library(limit, offset)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, results)
+	}
+}
+
 func handleGetConfig(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, cfg.Get())
@@ -414,6 +437,10 @@ func handleSetConfig(cfg Config, o Oled) http.HandlerFunc {
 			return
 		}
 		if err := validateOLED(next.OLED, o); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateBucket(next.Bucket); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -441,6 +468,25 @@ func validateOLED(oled config.OLED, o Oled) error {
 	}
 	if !slices.Contains(ports, oled.Port) {
 		return fmt.Errorf("port %q is not currently available", oled.Port)
+	}
+	return nil
+}
+
+// validateBucket rejects a Bucket config with a bogus mode or a negative
+// size — zero-valued sizes are fine (they mean "use the built-in default",
+// applied by cmd/pi-streamer, not this package).
+func validateBucket(b config.Bucket) error {
+	if b.Mode != "" && !config.IsAllowedMode(b.Mode) {
+		return fmt.Errorf("%q is not an allowed playback mode", b.Mode)
+	}
+	if b.MaxSizeMB < 0 {
+		return errors.New("bucket max size must not be negative")
+	}
+	if b.FavoritesMaxSizeMB < 0 {
+		return errors.New("favorites max size must not be negative")
+	}
+	if b.MinFreeMB < 0 {
+		return errors.New("minimum free disk space must not be negative")
 	}
 	return nil
 }
@@ -479,4 +525,43 @@ func handleOledPorts(o Oled) http.HandlerFunc {
 // backend validates against instead of a hand-copied duplicate.
 func handleOledBauds(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, config.AllowedBauds)
+}
+
+func handleBucketStatus(b Bucket) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, b.Status())
+	}
+}
+
+// handleBucketQuery reports, for a batch of URLs, whether each is currently
+// cached — so a rendered list of tracks (Queue/Search/Favorites/History)
+// needs one request for all its "cached" badges rather than one per row.
+func handleBucketQuery(b Bucket) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URLs []string `json:"urls"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, b.Query(req.URLs))
+	}
+}
+
+func handleBucketList(b Bucket) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		entries, err := b.List()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, entries)
+	}
+}
+
+func handleBucketDownloads(b Bucket) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, b.Downloads())
+	}
 }

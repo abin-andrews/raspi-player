@@ -20,9 +20,11 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 	mux.HandleFunc("POST /index", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			URL   string `json:"url"`
-			Title string `json:"title"`
-			Tags  string `json:"tags"`
+			URL    string `json:"url"`
+			Title  string `json:"title"`
+			Artist string `json:"artist"`
+			Album  string `json:"album"`
+			Tags   string `json:"tags"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -54,6 +56,30 @@ func newTestServer(t *testing.T) *httptest.Server {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(results)
+	})
+
+	mux.HandleFunc("GET /list", func(w http.ResponseWriter, r *http.Request) {
+		results := []Result{
+			{URL: "https://example.com/c", Title: "C", Tags: ""},
+			{URL: "https://example.com/a", Title: "A", Tags: "foo"},
+		}
+		if r.URL.Query().Get("limit") == "1" {
+			results = results[:1]
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(results)
+	})
+
+	mux.HandleFunc("GET /get", func(w http.ResponseWriter, r *http.Request) {
+		u := r.URL.Query().Get("url")
+		if u != "https://example.com/known" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Result{
+			URL: u, Title: "Known", Artist: "An Artist", Album: "An Album", Tags: "foo",
+		})
 	})
 
 	return httptest.NewServer(mux)
@@ -88,7 +114,7 @@ func TestIndexURLSuccess(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
-	if err := c.IndexURL("https://example.com/x", "Title X", "tag1,tag2"); err != nil {
+	if err := c.IndexURL("https://example.com/x", "Title X", "An Artist", "An Album", "tag1,tag2"); err != nil {
 		t.Fatalf("IndexURL returned error: %v", err)
 	}
 
@@ -97,15 +123,18 @@ func TestIndexURLSuccess(t *testing.T) {
 	}
 
 	var decoded struct {
-		URL   string `json:"url"`
-		Title string `json:"title"`
-		Tags  string `json:"tags"`
+		URL    string `json:"url"`
+		Title  string `json:"title"`
+		Artist string `json:"artist"`
+		Album  string `json:"album"`
+		Tags   string `json:"tags"`
 	}
 	if err := json.Unmarshal(gotBody, &decoded); err != nil {
 		t.Fatalf("decode request body: %v", err)
 	}
-	if decoded.URL != "https://example.com/x" || decoded.Title != "Title X" || decoded.Tags != "tag1,tag2" {
-		t.Errorf("decoded body = %+v, want {https://example.com/x Title X tag1,tag2}", decoded)
+	if decoded.URL != "https://example.com/x" || decoded.Title != "Title X" || decoded.Artist != "An Artist" ||
+		decoded.Album != "An Album" || decoded.Tags != "tag1,tag2" {
+		t.Errorf("decoded body = %+v, want {https://example.com/x Title X An Artist An Album tag1,tag2}", decoded)
 	}
 }
 
@@ -114,7 +143,7 @@ func TestIndexURLError(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
-	err := c.IndexURL("", "no url", "")
+	err := c.IndexURL("", "no url", "", "", "")
 	if err == nil {
 		t.Fatal("expected error for empty url, got nil")
 	}
@@ -192,5 +221,84 @@ func TestSearchError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "400") && !strings.Contains(err.Error(), "search failed") {
 		t.Errorf("error = %q, want it to mention the status code or body", err.Error())
+	}
+}
+
+func TestListSuccess(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	results, err := c.List(0, 0)
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(results) != 2 || results[0].URL != "https://example.com/c" {
+		t.Errorf("results = %+v, want c then a, no query needed", results)
+	}
+}
+
+func TestGetSuccess(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	result, ok, err := c.Get("https://example.com/known")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("Get ok = false, want true")
+	}
+	if result.Title != "Known" || result.Artist != "An Artist" || result.Album != "An Album" {
+		t.Errorf("Get result = %+v, want the known entry", result)
+	}
+}
+
+func TestGetNotFound(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	_, ok, err := c.Get("https://example.com/never-indexed")
+	if err != nil {
+		t.Fatalf("Get returned error: %v, want nil for a 404", err)
+	}
+	if ok {
+		t.Error("Get ok = true, want false for an unindexed URL")
+	}
+}
+
+func TestListOmitsParamsWhenNonPositive(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /list", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]Result{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	if _, err := c.List(0, 0); err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if gotQuery != "" {
+		t.Errorf("query = %q, want empty when limit/offset are both non-positive", gotQuery)
+	}
+}
+
+func TestListIncludesLimit(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	results, err := c.List(1, 0)
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1 (limit should have been applied)", len(results))
 	}
 }

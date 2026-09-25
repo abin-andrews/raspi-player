@@ -5,6 +5,8 @@
 .env
 config.json
 search.db
+/bucket-cache/
+/favorites/
 
 # Frontend
 /web/node_modules/

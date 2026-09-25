@@ -102,19 +102,24 @@ func (h *Hub) Broadcast(msg []byte) {
 	h.broadcast <- msg
 }
 
-// newRegisteredClient creates a client, queues initial onto its send
-// channel (if non-empty), and registers it with the hub, in that order —
-// so initial is guaranteed to be the first message the client ever
-// receives, strictly before any later Broadcast. This lets a newly
+// newRegisteredClient creates a client, queues each of initials (skipping
+// any empty one) onto its send channel in order, and registers it with the
+// hub — so initials are guaranteed to be the first messages the client
+// ever receives, strictly before any later Broadcast. This lets a newly
 // connecting UI (e.g. on page reload) get current state immediately
-// instead of waiting for the next unrelated state change to broadcast.
-// Queuing happens before registration: the hub's run loop can't reach this
-// client via a broadcast until it processes the register message, which
-// happens after initial is already sitting in the channel buffer.
-func (h *Hub) newRegisteredClient(initial []byte) *client {
+// instead of waiting for the next unrelated state change to broadcast; a
+// caller multiplexing more than one kind of state onto one connection
+// (e.g. status and bucket-download progress) passes one initial snapshot
+// of each. Queuing happens before registration: the hub's run loop can't
+// reach this client via a broadcast until it processes the register
+// message, which happens after initials are already sitting in the
+// channel buffer.
+func (h *Hub) newRegisteredClient(initials ...[]byte) *client {
 	c := &client{send: make(chan []byte, sendBufSize)}
-	if len(initial) > 0 {
-		c.send <- initial
+	for _, initial := range initials {
+		if len(initial) > 0 {
+			c.send <- initial
+		}
 	}
 	h.register <- c
 	return c
@@ -138,11 +143,13 @@ type Client struct {
 }
 
 // ServeWS upgrades the HTTP connection to a websocket, registers a new
-// Client with the hub, and starts its read/write pumps. initial, if
-// non-empty, is sent to this client immediately as its first message —
-// callers should pass the current state snapshot so a newly connecting UI
-// (e.g. on page reload while something is already playing) renders
-// correct state right away instead of waiting for the next broadcast.
+// Client with the hub, and starts its read/write pumps. Each non-empty
+// entry in initials is sent to this client immediately, in order, as its
+// first messages — callers should pass a current-state snapshot per kind
+// of state multiplexed onto this connection (e.g. one status envelope and
+// one bucket-downloads envelope) so a newly connecting UI (e.g. on page
+// reload while something is already playing/downloading) renders correct
+// state right away instead of waiting for the next broadcast of each kind.
 // Callers typically wire this up as an http.HandlerFunc, e.g.:
 //
 //	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -151,13 +158,13 @@ type Client struct {
 //			log.Printf("ws upgrade: %v", err)
 //		}
 //	})
-func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, initial []byte) error {
+func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, initials ...[]byte) error {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return err
 	}
 
-	c := h.newRegisteredClient(initial)
+	c := h.newRegisteredClient(initials...)
 	cl := &Client{hub: h, conn: conn, c: c}
 
 	go cl.writePump()

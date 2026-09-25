@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import {
   Alert,
   Badge,
@@ -147,4 +147,6 @@ function Search() {
   )
 }
 
-export default Search
+// Memoized: takes no props from App, so it shouldn't re-render on the
+// once-a-second status ticks that flow through the tree while playing.
+export default memo(Search)

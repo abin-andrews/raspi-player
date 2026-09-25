@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/indexer"
@@ -16,10 +17,11 @@ import (
 )
 
 // newRouter builds a router with a fakePlayer plus default (unconfigured)
-// fakeConfig/fakeOled — the tests below that don't care about config/OLED
-// behavior use this instead of constructing their own fakes.
+// fakeConfig/fakeOled/fakeBucket — the tests below that don't care about
+// config/OLED/bucket behavior use this instead of constructing their own
+// fakes.
 func newRouter(p Player) http.Handler {
-	return NewRouter(p, newFakeConfig(), newFakeOled())
+	return NewRouter(p, newFakeConfig(), newFakeOled(), newFakeBucket())
 }
 
 // fakeConfig is a minimal in-memory Config implementation for handler tests.
@@ -62,6 +64,34 @@ func (f *fakeOled) Status() OledStatus { return f.status }
 
 func (f *fakeOled) ListPorts() ([]string, error) { return f.ports, f.portsErr }
 
+// fakeBucket is a minimal in-memory Bucket implementation for handler tests.
+type fakeBucket struct {
+	status        BucketStatus
+	queryCalls    [][]string
+	queryResp     map[string]bool
+	listResp      []BucketEntry
+	listErr       error
+	downloadsResp []BucketDownload
+}
+
+func newFakeBucket() *fakeBucket { return &fakeBucket{} }
+
+func (f *fakeBucket) Status() BucketStatus { return f.status }
+
+func (f *fakeBucket) Query(urls []string) map[string]bool {
+	f.queryCalls = append(f.queryCalls, urls)
+	return f.queryResp
+}
+
+func (f *fakeBucket) List() ([]BucketEntry, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.listResp, nil
+}
+
+func (f *fakeBucket) Downloads() []BucketDownload { return f.downloadsResp }
+
 // fakePlayer is a minimal in-memory Player implementation for handler tests.
 type fakePlayer struct {
 	played    []string
@@ -84,6 +114,9 @@ type fakePlayer struct {
 
 	searchResults []indexer.Result
 	searchErr     error
+
+	libraryResults []indexer.Result
+	libraryErr     error
 
 	queue              []mpdclient.QueueTrack
 	addToQueueCalls    []string
@@ -207,6 +240,10 @@ func (f *fakePlayer) AlbumArt(url string) ([]byte, error) { return f.art, f.artE
 
 func (f *fakePlayer) Search(query string, limit int) ([]indexer.Result, error) {
 	return f.searchResults, f.searchErr
+}
+
+func (f *fakePlayer) Library(limit, offset int) ([]indexer.Result, error) {
+	return f.libraryResults, f.libraryErr
 }
 
 func (f *fakePlayer) Queue() ([]mpdclient.QueueTrack, error) {
@@ -559,6 +596,35 @@ func TestHandleSearch(t *testing.T) {
 	}
 }
 
+func TestHandleLibrary(t *testing.T) {
+	p := newFakePlayer()
+	p.libraryResults = []indexer.Result{{URL: "http://example.com/x.mp3", Title: "X"}}
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/library", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []indexer.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0] != p.libraryResults[0] {
+		t.Errorf("results = %v, want %v", got, p.libraryResults)
+	}
+}
+
+func TestHandleLibraryError(t *testing.T) {
+	p := newFakePlayer()
+	p.libraryErr = errors.New("library unavailable")
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/library", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
 func TestHandleGetQueue(t *testing.T) {
 	p := newFakePlayer()
 	p.queue = []mpdclient.QueueTrack{{ID: 1, Position: 0, URL: "http://example.com/a.mp3"}}
@@ -701,7 +767,7 @@ func TestHandleGetConfig(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM0", Baud: 115200}}
-	h := NewRouter(p, cfg, newFakeOled())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
 
 	rec := doRequest(t, h, "GET", "/api/config", "")
 	if rec.Code != http.StatusOK {
@@ -721,7 +787,7 @@ func TestHandleSetConfig(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o)
+	h := NewRouter(p, cfg, o, newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusOK {
@@ -736,7 +802,7 @@ func TestHandleSetConfig(t *testing.T) {
 func TestHandleSetConfigBadBody(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
-	h := NewRouter(p, cfg, newFakeOled())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -750,7 +816,7 @@ func TestHandleSetConfigError(t *testing.T) {
 	cfg.setErr = errors.New("write failed")
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o)
+	h := NewRouter(p, cfg, o, newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusInternalServerError {
@@ -763,7 +829,7 @@ func TestHandleSetConfigDisallowedBaud(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o)
+	h := NewRouter(p, cfg, o, newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":31337}}`)
 	if rec.Code != http.StatusBadRequest {
@@ -779,7 +845,7 @@ func TestHandleSetConfigUnavailablePort(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyUSB0"} // does not include the requested port
-	h := NewRouter(p, cfg, o)
+	h := NewRouter(p, cfg, o, newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusBadRequest {
@@ -794,7 +860,7 @@ func TestHandleSetConfigEmptyPortSkipsValidation(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	o := newFakeOled() // no ports registered, and no baud given either
-	h := NewRouter(p, cfg, o)
+	h := NewRouter(p, cfg, o, newFakeBucket())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"","baud":0}}`)
 	if rec.Code != http.StatusOK {
@@ -832,7 +898,7 @@ func TestHandleReloadConfig(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM1", Baud: 9600}}
-	h := NewRouter(p, cfg, newFakeOled())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
 
 	rec := doRequest(t, h, "POST", "/api/config/reload", "")
 	if rec.Code != http.StatusOK {
@@ -854,7 +920,7 @@ func TestHandleReloadConfigError(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.reloadErr = errors.New("read failed")
-	h := NewRouter(p, cfg, newFakeOled())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
 
 	rec := doRequest(t, h, "POST", "/api/config/reload", "")
 	if rec.Code != http.StatusInternalServerError {
@@ -866,7 +932,7 @@ func TestHandleOledStatus(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.status = OledStatus{Connected: true, Port: "/dev/ttyACM0", Baud: 115200}
-	h := NewRouter(p, newFakeConfig(), o)
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
 
 	rec := doRequest(t, h, "GET", "/api/oled/status", "")
 	if rec.Code != http.StatusOK {
@@ -885,7 +951,7 @@ func TestHandleOledPorts(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0", "/dev/ttyUSB0"}
-	h := NewRouter(p, newFakeConfig(), o)
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
 
 	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
 	if rec.Code != http.StatusOK {
@@ -904,10 +970,151 @@ func TestHandleOledPortsError(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.portsErr = errors.New("enumeration failed")
-	h := NewRouter(p, newFakeConfig(), o)
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
 
 	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleBucketStatus(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	b.status = BucketStatus{Mode: "bucket", UsedBytes: 100, MaxBytes: 1000}
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+
+	rec := doRequest(t, h, "GET", "/api/bucket/status", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got BucketStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != b.status {
+		t.Errorf("got %+v, want %+v", got, b.status)
+	}
+}
+
+func TestHandleBucketQuery(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	b.queryResp = map[string]bool{"http://example.com/a.mp3": true, "http://example.com/b.mp3": false}
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+
+	rec := doRequest(t, h, "POST", "/api/bucket/query",
+		`{"urls":["http://example.com/a.mp3","http://example.com/b.mp3"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got map[string]bool
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["http://example.com/a.mp3"] != true || got["http://example.com/b.mp3"] != false {
+		t.Errorf("got %v, want %v", got, b.queryResp)
+	}
+	if len(b.queryCalls) != 1 || len(b.queryCalls[0]) != 2 {
+		t.Errorf("queryCalls = %v, want one call with 2 URLs", b.queryCalls)
+	}
+}
+
+func TestHandleBucketQueryBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/bucket/query", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleBucketList(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	b.listResp = []BucketEntry{{URL: "http://example.com/a.mp3", SizeBytes: 1234, LastAccessed: when}}
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+
+	rec := doRequest(t, h, "GET", "/api/bucket/list", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []BucketEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0].URL != "http://example.com/a.mp3" || got[0].SizeBytes != 1234 {
+		t.Errorf("got %+v, want %+v", got, b.listResp)
+	}
+}
+
+func TestHandleBucketListError(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	b.listErr = errors.New("list failed")
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+
+	rec := doRequest(t, h, "GET", "/api/bucket/list", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleBucketDownloads(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	b.downloadsResp = []BucketDownload{
+		{URL: "http://example.com/a.mp3", ReceivedBytes: 500, TotalBytes: 2000},
+	}
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+
+	rec := doRequest(t, h, "GET", "/api/bucket/downloads", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []BucketDownload
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0].URL != "http://example.com/a.mp3" || got[0].ReceivedBytes != 500 {
+		t.Errorf("got %+v, want %+v", got, b.downloadsResp)
+	}
+}
+
+func TestHandleSetConfigDisallowedMode(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"bucket":{"mode":"teleport"}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSetConfigNegativeBucketSize(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"bucket":{"mode":"bucket","maxSizeMb":-1}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSetConfigValidBucketSettings(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+
+	rec := doRequest(t, h, "PUT", "/api/config",
+		`{"bucket":{"mode":"bucket","maxSizeMb":1024,"favoritesMaxSizeMb":2048,"minFreeMb":512}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	want := config.Bucket{Mode: config.ModeBucket, MaxSizeMB: 1024, FavoritesMaxSizeMB: 2048, MinFreeMB: 512}
+	if len(cfg.setCalls) != 1 || cfg.setCalls[0].Bucket != want {
+		t.Errorf("setCalls = %+v, want [%+v]", cfg.setCalls, want)
 	}
 }

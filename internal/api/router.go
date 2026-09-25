@@ -6,6 +6,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/indexer"
@@ -39,6 +40,10 @@ type Player interface {
 	History(limit int) ([]store.Track, error)
 
 	Search(query string, limit int) ([]indexer.Result, error)
+	// Library returns every indexed entry, most-recently-indexed first —
+	// the "media library" browsing view (no query needed), as opposed to
+	// Search's query-driven lookup.
+	Library(limit, offset int) ([]indexer.Result, error)
 
 	Queue() ([]mpdclient.QueueTrack, error)
 	AddToQueue(url string) error
@@ -75,8 +80,58 @@ type Oled interface {
 	ListPorts() ([]string, error)
 }
 
-// NewRouter builds the HTTP command API, dispatching to p, cfg, and o.
-func NewRouter(p Player, cfg Config, o Oled) http.Handler {
+// BucketStatus reports current usage of both the evictable playback cache
+// and the permanent favorites archive, for the Settings tab's display.
+type BucketStatus struct {
+	Mode               string `json:"mode"`
+	UsedBytes          int64  `json:"usedBytes"`
+	MaxBytes           int64  `json:"maxBytes"`
+	FavoritesUsedBytes int64  `json:"favoritesUsedBytes"`
+	FavoritesMaxBytes  int64  `json:"favoritesMaxBytes"`
+	DiskFreeBytes      int64  `json:"diskFreeBytes"`
+	MinFreeBytes       int64  `json:"minFreeBytes"`
+}
+
+// BucketEntry describes one file cached in the playback bucket, for the
+// Bucket tab's browsing view. URL is empty if this entry predates the
+// bucket's URL index (see internal/bucket.Entry).
+type BucketEntry struct {
+	URL          string    `json:"url"`
+	SizeBytes    int64     `json:"sizeBytes"`
+	LastAccessed time.Time `json:"lastAccessed"`
+}
+
+// Bucket is the subset of the daemon's local audio-file cache's behavior
+// the HTTP API needs.
+type Bucket interface {
+	Status() BucketStatus
+	// Query reports, for each of urls, whether it's currently cached in the
+	// playback bucket — bulk rather than one endpoint per URL, so a list of
+	// tracks needs only one round trip for their "cached" badges.
+	Query(urls []string) map[string]bool
+	// List returns every entry currently in the evictable playback cache
+	// (not the favorites archive — that's already browsable via
+	// GET /api/favorites), for the Bucket tab.
+	List() ([]BucketEntry, error)
+	// Downloads reports every download currently in flight, across both
+	// the playback cache and the favorites archive, for a UI to poll and
+	// show live progress (on-demand plays, background prefetches, and
+	// favorite-archiving all go through this the same way).
+	Downloads() []BucketDownload
+}
+
+// BucketDownload reports one in-flight download's progress — see
+// internal/bucket.Progress, which this mirrors at the API layer.
+type BucketDownload struct {
+	URL           string `json:"url"`
+	ReceivedBytes int64  `json:"receivedBytes"`
+	// TotalBytes is 0 if the origin didn't send a Content-Length (common
+	// for live/chunked streams) — show a spinner rather than a percentage.
+	TotalBytes int64 `json:"totalBytes"`
+}
+
+// NewRouter builds the HTTP command API, dispatching to p, cfg, o, and b.
+func NewRouter(p Player, cfg Config, o Oled, b Bucket) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/play", handlePlay(p))
@@ -102,6 +157,7 @@ func NewRouter(p Player, cfg Config, o Oled) http.Handler {
 	mux.HandleFunc("GET /api/history", handleHistory(p))
 
 	mux.HandleFunc("GET /api/search", handleSearch(p))
+	mux.HandleFunc("GET /api/library", handleLibrary(p))
 
 	mux.HandleFunc("GET /api/queue", handleGetQueue(p))
 	mux.HandleFunc("POST /api/queue", handleAddToQueue(p))
@@ -117,6 +173,11 @@ func NewRouter(p Player, cfg Config, o Oled) http.Handler {
 	mux.HandleFunc("GET /api/oled/status", handleOledStatus(o))
 	mux.HandleFunc("GET /api/oled/ports", handleOledPorts(o))
 	mux.HandleFunc("GET /api/oled/bauds", handleOledBauds)
+
+	mux.HandleFunc("GET /api/bucket/status", handleBucketStatus(b))
+	mux.HandleFunc("POST /api/bucket/query", handleBucketQuery(b))
+	mux.HandleFunc("GET /api/bucket/list", handleBucketList(b))
+	mux.HandleFunc("GET /api/bucket/downloads", handleBucketDownloads(b))
 
 	return mux
 }

@@ -96,6 +96,21 @@ func TestIsAllowedBaud(t *testing.T) {
 	}
 }
 
+func TestIsAllowedMode(t *testing.T) {
+	if !IsAllowedMode(ModeStream) {
+		t.Error("IsAllowedMode(ModeStream) = false, want true")
+	}
+	if !IsAllowedMode(ModeBucket) {
+		t.Error("IsAllowedMode(ModeBucket) = false, want true")
+	}
+	if IsAllowedMode("") {
+		t.Error(`IsAllowedMode("") = true, want false`)
+	}
+	if IsAllowedMode("bogus") {
+		t.Error(`IsAllowedMode("bogus") = true, want false`)
+	}
+}
+
 func TestReloadOnDeletedFileResetsToZeroValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	s, err := Open(path)

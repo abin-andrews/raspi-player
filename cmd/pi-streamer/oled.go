@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"pi-streamer/internal/api"
+	"pi-streamer/internal/bucket"
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/serial"
@@ -64,6 +65,7 @@ func (m *oledManager) send(parts ...string) {
 	if c == nil {
 		return
 	}
+	parts = truncateOLEDLine(parts)
 	line := strings.Join(parts, "\t")
 	log.Printf("oled -> %s", line)
 	reply, err := c.Send(line)
@@ -109,13 +111,17 @@ func (m *oledManager) close() {
 }
 
 // configAdapter bridges the on-disk config.Store to internal/api.Config,
-// applying an OLED port/baud change live whenever the config changes
-// (through Set) or is reloaded from disk — so editing it through the web UI
-// or hand-editing the file both take effect without a daemon restart.
+// applying every live-reconfigurable subsystem's settings (OLED
+// port/baud, bucket/favorites size caps and safety margin) whenever the
+// config changes (through Set) or is reloaded from disk — so editing it
+// through the web UI or hand-editing the file both take effect without a
+// daemon restart.
 type configAdapter struct {
-	store *config.Store
-	oled  *oledManager
-	// getStatus fetches the current mpd status, so a fresh connection
+	store     *config.Store
+	oled      *oledManager
+	cache     *bucket.Store // evictable playback cache
+	favorites *bucket.Store // permanent favorites archive
+	// getStatus fetches the current mpd status, so a fresh OLED connection
 	// syncs the display immediately instead of sitting on the sketch's
 	// boot-time placeholder values until the next unrelated status change.
 	getStatus func() (mpdclient.Status, error)
@@ -140,6 +146,11 @@ func (a *configAdapter) Reload() error {
 }
 
 func (a *configAdapter) apply(cfg config.Config) {
+	a.applyOLED(cfg)
+	a.applyBucket(cfg)
+}
+
+func (a *configAdapter) applyOLED(cfg config.Config) {
 	baud := cfg.OLED.Baud
 	if baud == 0 {
 		baud = 115200
@@ -154,6 +165,31 @@ func (a *configAdapter) apply(cfg config.Config) {
 		return
 	}
 	updateOLEDTrack(a.oled, status)
+}
+
+// applyBucket pushes the configured size caps/safety margin into both the
+// playback cache and the favorites archive live — SetMaxSize/SetMinFree
+// don't evict anything themselves; a lowered cap just takes effect on the
+// bucket's next Download.
+func (a *configAdapter) applyBucket(cfg config.Config) {
+	bucketMaxMB := cfg.Bucket.MaxSizeMB
+	if bucketMaxMB == 0 {
+		bucketMaxMB = config.DefaultBucketMaxSizeMB
+	}
+	favMaxMB := cfg.Bucket.FavoritesMaxSizeMB
+	if favMaxMB == 0 {
+		favMaxMB = config.DefaultFavoritesMaxSizeMB
+	}
+	minFreeMB := cfg.Bucket.MinFreeMB
+	if minFreeMB == 0 {
+		minFreeMB = config.DefaultMinFreeMB
+	}
+
+	const mb = 1024 * 1024
+	a.cache.SetMaxSize(int64(bucketMaxMB) * mb)
+	a.cache.SetMinFree(int64(minFreeMB) * mb)
+	a.favorites.SetMaxSize(int64(favMaxMB) * mb)
+	a.favorites.SetMinFree(int64(minFreeMB) * mb)
 }
 
 // oledState maps mpd's player state to arduino/control.ino's STATE enum.
@@ -176,6 +212,64 @@ func oledSanitize(s string) string {
 	return strings.ReplaceAll(s, "\n", " ")
 }
 
+// arduino/control.ino's fixed-size buffers: TITLE_CAP/TEXT_CAP each include
+// space for a null terminator, so usable content is one less. oledTruncate
+// caps a value to fit *before* sending, rather than relying on the
+// firmware's own copyText to cut it off: a value that fits in the buffer
+// but not within RX_CAP (the whole line's wire limit — see collectSerial's
+// discardingLine handling) doesn't get gracefully shortened, the entire
+// line is discarded and the field never updates at all (logged as "ERR").
+// This matters in practice: a fallback title (Status.Title empty, so
+// Status.Song — often a full URL — is sent instead) can easily run past
+// either limit.
+const (
+	oledTitleMax = 47 // TITLE_CAP - 1
+	oledTextMax  = 39 // TEXT_CAP - 1 (artist/album)
+)
+
+func oledTruncate(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
+	}
+	return string(r[:maxLen])
+}
+
+// maxOLEDLineBytes is the wire limit for one full command line (command +
+// tab-separated args), leaving room for the newline internal/serial.Client
+// appends and RX_CAP's own off-by-one — arduino/control.ino's
+// collectSerial discards (not gracefully shortens) anything longer,
+// replying ERR and leaving that field unchanged.
+const maxOLEDLineBytes = 60
+
+// truncateOLEDLine is a backstop beyond updateOLEDTrack's per-field
+// oledTruncate calls: it catches any value — current or future field,
+// including ones this package doesn't explicitly cap — that's still too
+// long once joined with its command name. mpd-derived metadata is
+// effectively unbounded (e.g. a fallback title built from a full URL, as
+// happened in practice), so send always checks the assembled line itself
+// rather than trusting every call site to have capped its own value.
+func truncateOLEDLine(parts []string) []string {
+	if len(parts) == 0 {
+		return parts
+	}
+	line := strings.Join(parts, "\t")
+	if len(line) <= maxOLEDLineBytes {
+		return parts
+	}
+	overflow := len(line) - maxOLEDLineBytes
+	last := len(parts) - 1
+	value := []rune(parts[last])
+	keep := len(value) - overflow
+	if keep < 0 {
+		keep = 0
+	}
+	out := append([]string{}, parts...)
+	out[last] = string(value[:keep])
+	log.Printf("oled: %q value truncated to fit the wire limit", parts[0])
+	return out
+}
+
 // updateOLEDTrack pushes a full batched update — BEGIN/.../END so the
 // display redraws only once, after every field has landed, instead of
 // flashing an in-between frame.
@@ -185,9 +279,9 @@ func updateOLEDTrack(m *oledManager, status mpdclient.Status) {
 		title = status.Song
 	}
 	m.send("BEGIN")
-	m.send("TITLE", oledSanitize(title))
-	m.send("ARTIST", oledSanitize(status.Artist))
-	m.send("ALBUM", oledSanitize(status.Album))
+	m.send("TITLE", oledSanitize(oledTruncate(title, oledTitleMax)))
+	m.send("ARTIST", oledSanitize(oledTruncate(status.Artist, oledTextMax)))
+	m.send("ALBUM", oledSanitize(oledTruncate(status.Album, oledTextMax)))
 	m.send("DURATION", strconv.Itoa(int(status.Duration)))
 	m.send("TIME", strconv.Itoa(int(status.Elapsed)))
 	m.send("STATE", oledState(status.State))
