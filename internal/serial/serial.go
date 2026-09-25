@@ -15,11 +15,13 @@ import (
 	"go.bug.st/serial"
 )
 
-const (
-	// chunkSize mirrors arduino/test.py: writing in small pieces rather
-	// than the whole line at once avoids overrunning the Uno's small
-	// hardware RX buffer.
-	chunkSize = 12
+// chunkSize mirrors arduino/test.py: writing in small pieces rather than the
+// whole line at once avoids overrunning the Uno's small hardware RX buffer.
+const chunkSize = 12
+
+// The rest are vars, not consts, so tests in this package can shrink them
+// instead of a real test run taking multiple seconds.
+var (
 	chunkDelay = 40 * time.Millisecond
 	// replyTimeout is the overall deadline for a command's reply line.
 	replyTimeout = 3 * time.Second
@@ -118,4 +120,11 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.port.Close()
+}
+
+// ListPorts returns the available serial port device paths (e.g.
+// "/dev/ttyACM0"), for a caller to offer as choices rather than requiring
+// the exact path to be known in advance.
+func ListPorts() ([]string, error) {
+	return serial.GetPortsList()
 }

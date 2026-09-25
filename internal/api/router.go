@@ -7,6 +7,7 @@ package api
 import (
 	"net/http"
 
+	"pi-streamer/internal/config"
 	"pi-streamer/internal/indexer"
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/store"
@@ -47,8 +48,35 @@ type Player interface {
 	ClearQueue() error
 }
 
-// NewRouter builds the HTTP command API, dispatching to p.
-func NewRouter(p Player) http.Handler {
+// Config is the subset of internal/config.Store's behavior the HTTP API
+// needs — Set persists to disk and applies the change live (e.g.
+// reconnecting the OLED display); Reload re-reads the file from disk,
+// picking up a hand-edit, and applies it the same way.
+type Config interface {
+	Get() config.Config
+	Set(cfg config.Config) error
+	Reload() error
+}
+
+// OledStatus reports the live state of the Arduino display's serial
+// connection, managed via Config rather than its own separate endpoints —
+// this is read-only.
+type OledStatus struct {
+	Connected bool   `json:"connected"`
+	Port      string `json:"port"`
+	Baud      int    `json:"baud"`
+	Error     string `json:"error,omitempty"`
+}
+
+// Oled is the subset of the daemon's OLED connection manager's behavior the
+// HTTP API needs.
+type Oled interface {
+	Status() OledStatus
+	ListPorts() ([]string, error)
+}
+
+// NewRouter builds the HTTP command API, dispatching to p, cfg, and o.
+func NewRouter(p Player, cfg Config, o Oled) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/play", handlePlay(p))
@@ -81,6 +109,14 @@ func NewRouter(p Player) http.Handler {
 	mux.HandleFunc("POST /api/queue/{id}/move", handleMoveInQueue(p))
 	mux.HandleFunc("POST /api/queue/{id}/play", handlePlayQueueItem(p))
 	mux.HandleFunc("DELETE /api/queue", handleClearQueue(p))
+
+	mux.HandleFunc("GET /api/config", handleGetConfig(cfg))
+	mux.HandleFunc("PUT /api/config", handleSetConfig(cfg, o))
+	mux.HandleFunc("POST /api/config/reload", handleReloadConfig(cfg))
+
+	mux.HandleFunc("GET /api/oled/status", handleOledStatus(o))
+	mux.HandleFunc("GET /api/oled/ports", handleOledPorts(o))
+	mux.HandleFunc("GET /api/oled/bauds", handleOledBauds)
 
 	return mux
 }

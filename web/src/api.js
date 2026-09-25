@@ -76,3 +76,16 @@ export const removeFromQueue = (id) => request('DELETE', `/api/queue/${id}`)
 export const moveInQueue = (id, position) => request('POST', `/api/queue/${id}/move`, { position })
 export const playQueueItem = (id) => request('POST', `/api/queue/${id}/play`)
 export const clearQueue = () => request('DELETE', '/api/queue')
+
+// Daemon settings (internal/config), currently just the OLED display's
+// serial connection. setConfig replaces the whole object — always send back
+// getConfig()'s result with your edits applied, not a partial patch.
+export const getConfig = () => request('GET', '/api/config')
+export const setConfig = (cfg) => request('PUT', '/api/config', cfg)
+export const reloadConfig = () => request('POST', '/api/config/reload')
+
+export const getOledStatus = () => request('GET', '/api/oled/status')
+export const getOledPorts = () => request('GET', '/api/oled/ports')
+// The allowed baud rates, straight from the backend (internal/config.AllowedBauds)
+// so this dropdown can never drift out of sync with what setConfig() will accept.
+export const getOledBauds = () => request('GET', '/api/oled/bauds')

@@ -3,7 +3,7 @@
 
 # Secrets and local runtime state — never commit these
 .env
-drive-config.json
+config.json
 search.db
 
 # Frontend

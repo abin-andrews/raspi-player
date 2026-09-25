@@ -3,15 +3,64 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"pi-streamer/internal/config"
 	"pi-streamer/internal/indexer"
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/store"
 )
+
+// newRouter builds a router with a fakePlayer plus default (unconfigured)
+// fakeConfig/fakeOled — the tests below that don't care about config/OLED
+// behavior use this instead of constructing their own fakes.
+func newRouter(p Player) http.Handler {
+	return NewRouter(p, newFakeConfig(), newFakeOled())
+}
+
+// fakeConfig is a minimal in-memory Config implementation for handler tests.
+type fakeConfig struct {
+	cfg         config.Config
+	setErr      error
+	reloadErr   error
+	setCalls    []config.Config
+	reloadCalls int
+}
+
+func newFakeConfig() *fakeConfig { return &fakeConfig{} }
+
+func (f *fakeConfig) Get() config.Config { return f.cfg }
+
+func (f *fakeConfig) Set(cfg config.Config) error {
+	if f.setErr != nil {
+		return f.setErr
+	}
+	f.cfg = cfg
+	f.setCalls = append(f.setCalls, cfg)
+	return nil
+}
+
+func (f *fakeConfig) Reload() error {
+	f.reloadCalls++
+	return f.reloadErr
+}
+
+// fakeOled is a minimal in-memory Oled implementation for handler tests.
+type fakeOled struct {
+	status   OledStatus
+	ports    []string
+	portsErr error
+}
+
+func newFakeOled() *fakeOled { return &fakeOled{} }
+
+func (f *fakeOled) Status() OledStatus { return f.status }
+
+func (f *fakeOled) ListPorts() ([]string, error) { return f.ports, f.portsErr }
 
 // fakePlayer is a minimal in-memory Player implementation for handler tests.
 type fakePlayer struct {
@@ -226,7 +275,7 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string) *httptes
 
 func TestHandlePlay(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/play", `{"url":"http://example.com/a.mp3"}`)
 	if rec.Code != http.StatusOK {
@@ -239,7 +288,7 @@ func TestHandlePlay(t *testing.T) {
 
 func TestHandlePlayBadBody(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/play", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -249,7 +298,7 @@ func TestHandlePlayBadBody(t *testing.T) {
 
 func TestHandlePauseResume(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/pause", "")
 	if rec.Code != http.StatusOK {
@@ -271,7 +320,7 @@ func TestHandlePauseResume(t *testing.T) {
 func TestHandleStatus(t *testing.T) {
 	p := newFakePlayer()
 	p.status = mpdclient.Status{State: "play", Song: "http://example.com/a.mp3"}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/status", "")
 	if rec.Code != http.StatusOK {
@@ -288,7 +337,7 @@ func TestHandleStatus(t *testing.T) {
 
 func TestHandleFavorites(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/favorites", `{"url":"http://example.com/fav.mp3","title":"Fav"}`)
 	if rec.Code != http.StatusCreated {
@@ -318,7 +367,7 @@ func TestHandleFavorites(t *testing.T) {
 
 func TestHandlePlaylists(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/playlists", `{"name":"chill"}`)
 	if rec.Code != http.StatusCreated {
@@ -357,7 +406,7 @@ func TestHandlePlaylists(t *testing.T) {
 
 func TestHandleAddToUnknownPlaylist(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/playlists/nope", `{"url":"http://example.com/x.mp3"}`)
 	if rec.Code != http.StatusNotFound {
@@ -368,7 +417,7 @@ func TestHandleAddToUnknownPlaylist(t *testing.T) {
 func TestHandleHistory(t *testing.T) {
 	p := newFakePlayer()
 	p.history = []store.Track{{URL: "http://example.com/a.mp3"}}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/history", "")
 	if rec.Code != http.StatusOK {
@@ -385,7 +434,7 @@ func TestHandleHistory(t *testing.T) {
 
 func TestHandleSeek(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/seek", `{"seconds":42.5}`)
 	if rec.Code != http.StatusOK {
@@ -398,7 +447,7 @@ func TestHandleSeek(t *testing.T) {
 
 func TestHandleNext(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/next", "")
 	if rec.Code != http.StatusOK {
@@ -411,7 +460,7 @@ func TestHandleNext(t *testing.T) {
 
 func TestHandlePrevious(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/previous", "")
 	if rec.Code != http.StatusOK {
@@ -424,7 +473,7 @@ func TestHandlePrevious(t *testing.T) {
 
 func TestHandleVolume(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/volume", `{"volume":75}`)
 	if rec.Code != http.StatusOK {
@@ -437,7 +486,7 @@ func TestHandleVolume(t *testing.T) {
 
 func TestHandleVolumeBadBody(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/volume", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -447,7 +496,7 @@ func TestHandleVolumeBadBody(t *testing.T) {
 
 func TestHandleSeekRelative(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/seek/relative", `{"seconds":-10.5}`)
 	if rec.Code != http.StatusOK {
@@ -460,7 +509,7 @@ func TestHandleSeekRelative(t *testing.T) {
 
 func TestHandleSeekRelativeBadBody(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/seek/relative", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -471,7 +520,7 @@ func TestHandleSeekRelativeBadBody(t *testing.T) {
 func TestHandleAlbumArtFound(t *testing.T) {
 	p := newFakePlayer()
 	p.art = []byte("fake-jpeg-bytes")
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/albumart?url=http://example.com/a.mp3", "")
 	if rec.Code != http.StatusOK {
@@ -484,7 +533,7 @@ func TestHandleAlbumArtFound(t *testing.T) {
 
 func TestHandleAlbumArtNotFound(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/albumart?url=http://example.com/a.mp3", "")
 	if rec.Code != http.StatusNotFound {
@@ -495,7 +544,7 @@ func TestHandleAlbumArtNotFound(t *testing.T) {
 func TestHandleSearch(t *testing.T) {
 	p := newFakePlayer()
 	p.searchResults = []indexer.Result{{URL: "http://example.com/x.mp3", Title: "X"}}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/search?q=x", "")
 	if rec.Code != http.StatusOK {
@@ -513,7 +562,7 @@ func TestHandleSearch(t *testing.T) {
 func TestHandleGetQueue(t *testing.T) {
 	p := newFakePlayer()
 	p.queue = []mpdclient.QueueTrack{{ID: 1, Position: 0, URL: "http://example.com/a.mp3"}}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/queue", "")
 	if rec.Code != http.StatusOK {
@@ -530,7 +579,7 @@ func TestHandleGetQueue(t *testing.T) {
 
 func TestHandleAddToQueue(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue", `{"url":"http://example.com/a.mp3"}`)
 	if rec.Code != http.StatusCreated {
@@ -543,7 +592,7 @@ func TestHandleAddToQueue(t *testing.T) {
 
 func TestHandleAddToQueueBadBody(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -554,7 +603,7 @@ func TestHandleAddToQueueBadBody(t *testing.T) {
 func TestHandleRemoveFromQueue(t *testing.T) {
 	p := newFakePlayer()
 	p.queue = []mpdclient.QueueTrack{{ID: 5, URL: "http://example.com/a.mp3"}}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "DELETE", "/api/queue/5", "")
 	if rec.Code != http.StatusNoContent {
@@ -567,7 +616,7 @@ func TestHandleRemoveFromQueue(t *testing.T) {
 
 func TestHandleRemoveFromQueueBadID(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "DELETE", "/api/queue/not-a-number", "")
 	if rec.Code != http.StatusBadRequest {
@@ -577,7 +626,7 @@ func TestHandleRemoveFromQueueBadID(t *testing.T) {
 
 func TestHandleMoveInQueue(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue/5/move", `{"position":2}`)
 	if rec.Code != http.StatusOK {
@@ -590,7 +639,7 @@ func TestHandleMoveInQueue(t *testing.T) {
 
 func TestHandleMoveInQueueBadID(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue/not-a-number/move", `{"position":2}`)
 	if rec.Code != http.StatusBadRequest {
@@ -600,7 +649,7 @@ func TestHandleMoveInQueueBadID(t *testing.T) {
 
 func TestHandleMoveInQueueBadBody(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue/5/move", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -610,7 +659,7 @@ func TestHandleMoveInQueueBadBody(t *testing.T) {
 
 func TestHandlePlayQueueItem(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue/5/play", "")
 	if rec.Code != http.StatusOK {
@@ -623,7 +672,7 @@ func TestHandlePlayQueueItem(t *testing.T) {
 
 func TestHandlePlayQueueItemBadID(t *testing.T) {
 	p := newFakePlayer()
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "POST", "/api/queue/not-a-number/play", "")
 	if rec.Code != http.StatusBadRequest {
@@ -634,7 +683,7 @@ func TestHandlePlayQueueItemBadID(t *testing.T) {
 func TestHandleClearQueue(t *testing.T) {
 	p := newFakePlayer()
 	p.queue = []mpdclient.QueueTrack{{ID: 1, URL: "http://example.com/a.mp3"}}
-	h := NewRouter(p)
+	h := newRouter(p)
 
 	rec := doRequest(t, h, "DELETE", "/api/queue", "")
 	if rec.Code != http.StatusNoContent {
@@ -645,5 +694,220 @@ func TestHandleClearQueue(t *testing.T) {
 	}
 	if len(p.queue) != 0 {
 		t.Errorf("queue after clear = %v, want empty", p.queue)
+	}
+}
+
+func TestHandleGetConfig(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM0", Baud: 115200}}
+	h := NewRouter(p, cfg, newFakeOled())
+
+	rec := doRequest(t, h, "GET", "/api/config", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got config.Config
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != cfg.cfg {
+		t.Errorf("got %+v, want %+v", got, cfg.cfg)
+	}
+}
+
+func TestHandleSetConfig(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	o := newFakeOled()
+	o.ports = []string{"/dev/ttyACM0"}
+	h := NewRouter(p, cfg, o)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	want := config.Config{OLED: config.OLED{Port: "/dev/ttyACM0", Baud: 115200}}
+	if len(cfg.setCalls) != 1 || cfg.setCalls[0] != want {
+		t.Errorf("setCalls = %+v, want [%+v]", cfg.setCalls, want)
+	}
+}
+
+func TestHandleSetConfigBadBody(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	h := NewRouter(p, cfg, newFakeOled())
+
+	rec := doRequest(t, h, "PUT", "/api/config", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSetConfigError(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	cfg.setErr = errors.New("write failed")
+	o := newFakeOled()
+	o.ports = []string{"/dev/ttyACM0"}
+	h := NewRouter(p, cfg, o)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleSetConfigDisallowedBaud(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	o := newFakeOled()
+	o.ports = []string{"/dev/ttyACM0"}
+	h := NewRouter(p, cfg, o)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":31337}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(cfg.setCalls) != 0 {
+		t.Errorf("setCalls = %+v, want none (validation should reject before Set)", cfg.setCalls)
+	}
+}
+
+func TestHandleSetConfigUnavailablePort(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	o := newFakeOled()
+	o.ports = []string{"/dev/ttyUSB0"} // does not include the requested port
+	h := NewRouter(p, cfg, o)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(cfg.setCalls) != 0 {
+		t.Errorf("setCalls = %+v, want none (validation should reject before Set)", cfg.setCalls)
+	}
+}
+
+func TestHandleSetConfigEmptyPortSkipsValidation(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	o := newFakeOled() // no ports registered, and no baud given either
+	h := NewRouter(p, cfg, o)
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"","baud":0}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (empty port means \"disabled\", always allowed); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleOledBauds(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/oled/bauds", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []int
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) == 0 {
+		t.Error("bauds list is empty, want at least the common rates")
+	}
+	found := false
+	for _, b := range got {
+		if b == 115200 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("bauds = %v, want it to include 115200", got)
+	}
+}
+
+func TestHandleReloadConfig(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM1", Baud: 9600}}
+	h := NewRouter(p, cfg, newFakeOled())
+
+	rec := doRequest(t, h, "POST", "/api/config/reload", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if cfg.reloadCalls != 1 {
+		t.Errorf("reloadCalls = %d, want 1", cfg.reloadCalls)
+	}
+	var got config.Config
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != cfg.cfg {
+		t.Errorf("got %+v, want %+v", got, cfg.cfg)
+	}
+}
+
+func TestHandleReloadConfigError(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	cfg.reloadErr = errors.New("read failed")
+	h := NewRouter(p, cfg, newFakeOled())
+
+	rec := doRequest(t, h, "POST", "/api/config/reload", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleOledStatus(t *testing.T) {
+	p := newFakePlayer()
+	o := newFakeOled()
+	o.status = OledStatus{Connected: true, Port: "/dev/ttyACM0", Baud: 115200}
+	h := NewRouter(p, newFakeConfig(), o)
+
+	rec := doRequest(t, h, "GET", "/api/oled/status", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got OledStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != o.status {
+		t.Errorf("got %+v, want %+v", got, o.status)
+	}
+}
+
+func TestHandleOledPorts(t *testing.T) {
+	p := newFakePlayer()
+	o := newFakeOled()
+	o.ports = []string{"/dev/ttyACM0", "/dev/ttyUSB0"}
+	h := NewRouter(p, newFakeConfig(), o)
+
+	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 2 || got[0] != "/dev/ttyACM0" || got[1] != "/dev/ttyUSB0" {
+		t.Errorf("got %v, want %v", got, o.ports)
+	}
+}
+
+func TestHandleOledPortsError(t *testing.T) {
+	p := newFakePlayer()
+	o := newFakeOled()
+	o.portsErr = errors.New("enumeration failed")
+	h := NewRouter(p, newFakeConfig(), o)
+
+	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }

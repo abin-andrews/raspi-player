@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"pi-streamer/internal/api"
+	"pi-streamer/internal/config"
 	"pi-streamer/internal/indexer"
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/player"
@@ -22,6 +23,9 @@ func main() {
 	httpAddr := flag.String("http-addr", ":8080", "address for the HTTP+WebSocket API to listen on")
 	webDir := flag.String("web-dir", "web/dist", "directory of the built frontend to serve at /")
 	indexerAddr := flag.String("indexer-addr", "http://127.0.0.1:8081", "address of the search-indexer service")
+	configPath := flag.String("config-path", "config.json",
+		"path to the daemon's settings file (currently just the OLED display's serial port/baud) — "+
+			"editable through the web UI, or by hand followed by POST /api/config/reload")
 	flag.Parse()
 
 	mpdConn, err := mpdclient.Dial("tcp", *mpdAddr)
@@ -33,6 +37,18 @@ func main() {
 	idx := indexer.New(*indexerAddr)
 	p := player.New(mpdConn, store.NewMemoryStore(), idx)
 	hub := ws.NewHub()
+
+	// The OLED display is an optional accessory, configured at runtime
+	// (not via flags) through cfg/the web UI's Settings — the daemon runs
+	// fine with no Arduino attached, it just skips these updates.
+	cfgStore, err := config.Open(*configPath)
+	if err != nil {
+		log.Fatalf("open config at %s: %v", *configPath, err)
+	}
+	oled := &oledManager{}
+	defer oled.close()
+	cfg := &configAdapter{store: cfgStore, oled: oled, getStatus: p.Status}
+	cfg.apply(cfgStore.Get())
 
 	// broadcastStatus fetches the current mpd status and pushes it to every
 	// connected WebSocket client. It's the shared endpoint for both the
@@ -49,6 +65,7 @@ func main() {
 			return
 		}
 		hub.Broadcast(data)
+		updateOLEDTrack(oled, status)
 	}
 
 	// Idle-driven: push immediately on player/mixer changes reported by
@@ -89,11 +106,12 @@ func main() {
 				continue
 			}
 			hub.Broadcast(data)
+			updateOLEDElapsed(oled, status.Elapsed)
 		}
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/", api.NewRouter(p))
+	mux.Handle("/api/", api.NewRouter(p, cfg, oled))
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// Send the new client its current status immediately, rather than
 		// leaving it to wait for the next unrelated state change — this is

@@ -11,10 +11,14 @@ play/pause/resume/next/previous, absolute + relative seek), volume/mute, track m
 elapsed/duration/volume) and best-effort album art from mpd, favorites/playlists/history, and full-text search
 over previously played/favorited/playlisted URLs (the daemon proxies to `cmd/search-indexer`). A persistent
 bottom player bar (`PlayerBar.jsx`) is visible on every tab; live status reaches the frontend over
-`internal/ws`'s WebSocket hub (finally fed — see Architecture notes) instead of polling. A Google Drive
-integration (`internal/drive`) scans a user-designated folder for audio files and feeds them into the same
-search index, streamed via an on-demand proxy since mpd can't authenticate to Drive itself. Update this file
-as the project grows; don't let it drift from reality.
+`internal/ws`'s WebSocket hub (finally fed — see Architecture notes) instead of polling. A previous Google
+Drive integration (`internal/drive`) has been removed for now (may return later). `internal/serial` is a new
+addition: a generic line-based serial transport for driving an Arduino Uno + SSD1322 OLED
+(`arduino/control.ino`) over USB, so the daemon can mirror now-playing state onto a physical display, wired up
+end-to-end from `cmd/pi-streamer/oled.go` through a Settings tab in the web UI. `internal/config` is a small
+on-disk JSON settings store backing that Settings tab (currently just the OLED port/baud) — the daemon's only
+persistent/disk state right now, and deliberately structured so more settings can be added to it later.
+Update this file as the project grows; don't let it drift from reality.
 
 ## Purpose
 
@@ -64,14 +68,17 @@ internal/search/       SQLite/FTS5 search index (modernc.org/sqlite). Used by cm
 internal/indexer/      HTTP client the daemon uses to talk to cmd/search-indexer (IndexURL, Search). Own
                         json-tagged Result type, independent of internal/search.Result (no sqlite dependency
                         pulled into the main daemon binary). player.Indexer interface wraps it for testability.
-internal/drive/         Google Drive integration: Store (the app's only persistent/disk state — an OAuth
-                        token + folder ID), OAuth (consent URL + CSRF state), Client (Scan a folder, Download
-                        a file with Range support), Manager (orchestrates scan-status tracking + indexing,
-                        the piece internal/api actually talks to). See Architecture notes below.
+internal/serial/       Generic line-based serial transport (go.bug.st/serial, pure Go/no CGO — same ARM
+                        cross-compilation constraint as internal/search's sqlite driver): Open a port at a
+                        baud rate, Send a line, get back one reply line, ListPorts to enumerate devices.
+                        Knows nothing about any specific device's command vocabulary — see Architecture
+                        notes for the OLED protocol it carries.
+internal/config/       Small on-disk JSON settings store (currently just the OLED port/baud) — Get/Set/
+                        Reload. See Architecture notes; this is the app's only persistent/disk state.
 
 web/                    React (Vite) + Mantine player UI: Now Playing, Queue, Search, Favorites, Playlists,
-                        History, and Drive (connect/scan controls only, see below) tabs, plus a persistent
-                        PlayerBar (transport/skip/volume) shown on every tab. Icons via @tabler/icons-react.
+                        and History tabs, plus a persistent PlayerBar (transport/skip/volume) shown on every
+                        tab. Icons via @tabler/icons-react.
                         web/src/hooks/usePlaybackStatus.js is the single WebSocket connection per tab (called
                         once in App.jsx, status passed down as a prop) — components needing live status must
                         NOT open their own connection or poll. App.jsx doesn't render any tab content at all
@@ -131,32 +138,41 @@ web/                    React (Vite) + Mantine player UI: Now Playing, Queue, Se
   `DELETE /api/queue/{id}`, `POST /api/queue/{id}/move {position}`, `POST /api/queue/{id}/play`,
   `DELETE /api/queue` (clear all). There's no backend "mute" — the frontend
   remembers the last non-zero volume locally and toggles `POST /api/volume {0}` / restore, purely client-side.
-- **Google Drive integration** (`internal/drive`): mpd can't attach an `Authorization` header to a per-track
-  URL, so it can never play an authenticated Drive link directly. The daemon proxies instead:
-  `GET /api/drive/stream/{fileId}` authenticates to Drive itself and streams the bytes through (forwarding
-  `Range` for seek support — Drive's `alt=media` responses already set `Content-Type`/`Content-Range`/
-  `Accept-Ranges` correctly, so the handler just copies them through rather than re-deriving them). A scan
-  indexes each found file with THIS proxy URL (not the raw Drive link) via the same `internal/indexer` client
-  the rest of the app already uses — meaning `PlayURL`/`AddToQueue`/etc. needed zero changes to support Drive
-  playback once a proxy URL comes back from search. `internal/drive.Store` is the app's **only** persistent
-  (disk) state — a JSON file (`-drive-config-path`, default `drive-config.json`, written `0600`) holding the
-  OAuth client ID/secret, token, and configured folder ID; everything else in this app is in-memory-only, and
-  this is a deliberate, necessary exception (the token must survive daemon restarts).
-  **Two ways to provide the OAuth client ID/secret, in precedence order**: (1) the app's Drive tab Settings
-  section (`POST /api/drive/credentials`) — persisted to `Store` and applied to the live `OAuth` config
-  immediately via `OAuth.SetCredentials`, no restart needed; this is the friendlier path for a single-user Pi
-  deployment. (2) `DRIVE_CLIENT_ID`/`DRIVE_CLIENT_SECRET` **environment variables** — never a flag (visible in
-  `ps`), never hardcoded — read once at startup as a fallback/bootstrap default only if `Store` has nothing
-  saved yet (see `cmd/pi-streamer/main.go`). Either way the user must create their own Google Cloud OAuth
-  client. The secret is never echoed back by any API response — `GET /api/drive/status` only reports a
-  `credentialsConfigured` boolean, matching how it also never echoes the OAuth token itself. `-drive-redirect-
-  url` must exactly match what's registered in Google Cloud Console. `internal/api`'s `Drive` interface and
-  `internal/drive.Manager`'s `scanner`/`Indexer` sub-interfaces follow the same "package defines the narrow
-  interface it needs, concrete types satisfy it structurally" pattern as `Player`/`mpdclient.Client`/
-  `store.Store` throughout this codebase. **Known cost**: `google.golang.org/api` (+ its gRPC/OpenTelemetry
-  transitive deps) roughly **doubled** the daemon's ARM binary size (~9.8MB → ~21MB) even though only the
-  Drive endpoint is used — worth knowing on a Pi Zero 2W, not currently addressed (e.g. no lighter-weight
-  direct-REST-call alternative to the generated client has been pursued).
+  Settings routes (see `internal/config`/OLED notes below): `GET`/`PUT /api/config` (the whole settings
+  object; `PUT` persists and applies live), `POST /api/config/reload` (re-read the file from disk),
+  `GET /api/oled/status`, `GET /api/oled/ports` (serial port auto-detection for the UI's dropdown).
+- **Google Drive integration removed** (was `internal/drive`, plus a Drive tab in the frontend and
+  `-public-base-url`/`-drive-config-path`/`-drive-redirect-url` flags/`DRIVE_CLIENT_ID`/`DRIVE_CLIENT_SECRET`
+  env vars in `main.go`): pulled out for now to drop `google.golang.org/api` (+ its gRPC/OpenTelemetry
+  transitive deps), which had roughly **doubled** the daemon's ARM binary size (~9.8MB → ~21MB) for a feature
+  most deployments don't use. May come back later behind a lighter-weight direct-REST-call client instead of
+  the generated one. Its removal briefly left the daemon with no persistent/disk state at all; `internal/config`
+  (below) has since reintroduced a small one, for OLED settings.
+- **Arduino OLED display** (`arduino/control.ino`, driven by `internal/serial`): a Uno + SSD1322 256x64 SPI
+  display attached over USB, meant to mirror now-playing state (title/artist/album/elapsed/duration/state)
+  physically. `internal/serial.Client` is a generic transport — `Open(port, baud)`, then `Send(line) (reply
+  string, err error)` — chunking each write into 12-byte pieces with a 40ms gap (mirrors `arduino/test.py`;
+  a classic Uno's small hardware RX buffer can't be trusted with a burst write) and polling reads with a
+  short per-read timeout so a silent device times out in ~3s instead of blocking forever (a timed-out
+  `go.bug.st/serial` `Read` returns `(0, nil)`, not an error). The OLED's own command vocabulary
+  (`BEGIN`/`TITLE`/`ARTIST`/`ALBUM`/`DURATION`/`TIME`/`STATE`/`END`, one per line, each acknowledged with
+  `OK`/`ERR`) is deliberately **not** modeled in `internal/serial` — that protocol knowledge (plus the
+  live-reconnectable `oledManager` and its `sync.Mutex`-guarded `*serial.Client`) lives in
+  `cmd/pi-streamer/oled.go`. `go.bug.st/serial` is pure Go (no CGO), verified to cross-compile clean for both
+  `GOOS=linux GOARCH=arm` and `GOARCH=arm64`, same rationale as `modernc.org/sqlite` above.
+- **`internal/config`**: a small on-disk JSON settings store (`config.Store`), reintroducing persistent state
+  after the Drive removal above — currently holds just `OLED.Port`/`OLED.Baud`, but `Config` is structured so
+  more settings can be added later without a new mechanism. `Store.Get`/`Set`/`Reload` are the whole API;
+  `Set` persists to disk, `Reload` re-reads the file (picking up a hand-edit made directly on the Pi, e.g. over
+  SSH) — neither is wired to *do* anything by itself. `cmd/pi-streamer/oled.go`'s `configAdapter` is what
+  bridges `Store` to `internal/api.Config` and gives `Set`/`Reload` their live effect, by calling
+  `oledManager.reconfigure` with the new port/baud on every change (an empty port disconnects). This is the
+  **web UI's actual mechanism for configuring the OLED display**: `web/src/components/Settings.jsx` (the
+  Settings tab) calls `GET/PUT /api/config` and `POST /api/config/reload`, plus `GET /api/oled/status` and
+  `GET /api/oled/ports` (serial port auto-detection via `internal/serial.ListPorts`, wrapping
+  `go.bug.st/serial.GetPortsList`) so the user picks a port from a dropdown rather than typing a device path.
+  There are deliberately no separate connect/disconnect endpoints — connecting *is* the side effect of setting
+  `oled.port` in config. Default path: `-config-path` (default `config.json`, written `0600`, gitignored).
 - The Pi Zero 2W is resource-constrained: favor a lightweight daemon and frontend build. `cmd/pi-streamer`
   serves `web/dist` as static files at `/` (via the `-web-dir` flag, default `"web/dist"`) alongside `/api`
   and `/ws`, so `make web-build && make run` serves the whole app from one process. Not yet done: embedding
@@ -214,12 +230,9 @@ To run a single Go test: `go test ./internal/player/ -run TestPauseAndResume -v`
 package). `GOARM=6` targets the Pi Zero's ARMv6 baseline; Zero 2W's Cortex-A53 also supports ARMv7/64-bit
 if the deployed OS image turns out to be 64-bit — override with `GOARM=7` or use `make build-pi64` instead.
 
-`cmd/pi-streamer` flags beyond the earlier ones: `-public-base-url` (default `http://127.0.0.1:8080`, must be
-reachable by mpd — used to build the Drive stream proxy URLs that get indexed), `-drive-config-path` (default
-`drive-config.json`), `-drive-redirect-url` (default `http://127.0.0.1:8080/api/drive/oauth/callback`, must
-exactly match Google Cloud Console). Google Drive also needs `DRIVE_CLIENT_ID`/`DRIVE_CLIENT_SECRET` set —
-either via the Drive tab's Settings section in the running app (persisted to `drive-config.json`, takes
-effect immediately), or as environment variables (fallback/bootstrap path, e.g. for headless first-run setup).
-The daemon runs fine without either, Drive features just won't work until one is set. `make run` auto-loads a
-`.env` file from the repo root if present (`.env.example` is the tracked template — copy it to `.env`, which
-is gitignored, and fill in real values there; never commit real credentials).
+`cmd/pi-streamer` flags beyond the earlier ones: `-config-path` (default `config.json`) — the OLED display's
+serial port/baud aren't flags at all; they're configured live through the web UI's Settings tab (or by hand-
+editing this file and calling `POST /api/config/reload`), not at startup, so no daemon restart is needed to
+plug in a display, change ports, or turn it off. The daemon runs fine with no OLED section configured; the
+display integration is simply skipped. `make run` auto-loads a `.env` file from the repo root if present, for
+any future secrets — none are currently needed (`.env` is gitignored; never commit real credentials).

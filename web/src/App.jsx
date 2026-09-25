@@ -1,5 +1,5 @@
 import { AppShell, Center, Container, Loader, Stack, Tabs, Text, Title } from '@mantine/core'
-import { IconSearch } from '@tabler/icons-react'
+import { IconSearch, IconSettings } from '@tabler/icons-react'
 import { usePlaybackStatus } from './hooks/usePlaybackStatus.js'
 import NowPlaying from './components/NowPlaying.jsx'
 import Favorites from './components/Favorites.jsx'
@@ -7,6 +7,7 @@ import Playlists from './components/Playlists.jsx'
 import History from './components/History.jsx'
 import Search from './components/Search.jsx'
 import Queue from './components/Queue.jsx'
+import Settings from './components/Settings.jsx'
 import PlayerBar from './components/PlayerBar.jsx'
 
 function App() {
@@ -55,6 +56,9 @@ function App() {
               <Tabs.Tab value="favorites">Favorites</Tabs.Tab>
               <Tabs.Tab value="playlists">Playlists</Tabs.Tab>
               <Tabs.Tab value="history">History</Tabs.Tab>
+              <Tabs.Tab value="settings" leftSection={<IconSettings size={16} />}>
+                Settings
+              </Tabs.Tab>
             </Tabs.List>
 
             <Tabs.Panel value="search" pt="md">
@@ -74,6 +78,9 @@ function App() {
             </Tabs.Panel>
             <Tabs.Panel value="history" pt="md">
               <History />
+            </Tabs.Panel>
+            <Tabs.Panel value="settings" pt="md">
+              <Settings />
             </Tabs.Panel>
           </Tabs>
         </Container>

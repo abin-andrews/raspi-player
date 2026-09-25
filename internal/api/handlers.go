@@ -3,9 +3,12 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 
+	"pi-streamer/internal/config"
 	"pi-streamer/internal/store"
 )
 
@@ -389,4 +392,91 @@ func handleSearch(p Player) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, results)
 	}
+}
+
+func handleGetConfig(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, cfg.Get())
+	}
+}
+
+// handleSetConfig replaces the whole config (not a partial patch) and
+// persists it — the frontend always sends back the full object it got from
+// GET /api/config with its edits applied. The OLED port/baud are validated
+// against the daemon's own currently-detected ports and allowed baud rates
+// before anything is written, rather than trusting arbitrary client input
+// (a typo'd port would otherwise just silently fail to connect later).
+func handleSetConfig(cfg Config, o Oled) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var next config.Config
+		if err := decodeJSON(r, &next); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateOLED(next.OLED, o); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := cfg.Set(next); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, next)
+	}
+}
+
+// validateOLED rejects an OLED config the daemon shouldn't even attempt: an
+// empty port always passes (that's "disabled"), but a non-empty one must
+// name a port o currently sees attached, at one of the allowed baud rates.
+func validateOLED(oled config.OLED, o Oled) error {
+	if oled.Port == "" {
+		return nil
+	}
+	if !config.IsAllowedBaud(oled.Baud) {
+		return fmt.Errorf("%d is not an allowed baud rate", oled.Baud)
+	}
+	ports, err := o.ListPorts()
+	if err != nil {
+		return fmt.Errorf("list serial ports: %w", err)
+	}
+	if !slices.Contains(ports, oled.Port) {
+		return fmt.Errorf("port %q is not currently available", oled.Port)
+	}
+	return nil
+}
+
+// handleReloadConfig re-reads the config file from disk, for picking up a
+// hand-edit (e.g. made over SSH) without restarting the daemon.
+func handleReloadConfig(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := cfg.Reload(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, cfg.Get())
+	}
+}
+
+func handleOledStatus(o Oled) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, o.Status())
+	}
+}
+
+func handleOledPorts(o Oled) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ports, err := o.ListPorts()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, ports)
+	}
+}
+
+// handleOledBauds returns the fixed set of baud rates the daemon accepts,
+// so the frontend's dropdown is always built from the same list the
+// backend validates against instead of a hand-copied duplicate.
+func handleOledBauds(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, config.AllowedBauds)
 }

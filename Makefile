@@ -11,7 +11,7 @@ GOARM      ?= 6
 PI_HOST    ?= pi@raspberrypi.local
 PI_PATH    ?= ~/pi-streamer
 
-.PHONY: all build run test fmt vet lint clean \
+.PHONY: all build run dev test fmt vet lint clean \
 	build-pi build-pi64 build-all deploy-pi deploy-pi64 \
 	build-indexer run-indexer \
 	web-install web-build web-test \
@@ -47,6 +47,13 @@ build:
 
 run: build
 	@if [ -f .env ]; then set -a; . ./.env; set +a; fi; ./$(BIN_DIR)/$(BINARY)
+
+# Brings up search-indexer + daemon + frontend dev server together in one
+# foreground command; Ctrl+C stops all three. Extra args pass through to the
+# daemon, e.g. `make dev ARGS="-oled-port /dev/ttyACM0"`. Assumes mpd itself
+# is already running.
+dev:
+	@./scripts/dev.sh $(ARGS)
 
 ## Raspberry Pi Zero 2W (ARM)
 
@@ -85,7 +92,7 @@ web-test:
 
 help:
 	@echo "Common:    make install-deps | make test | make fmt | make vet | make lint | make clean"
-	@echo "x86:       make build | make run"
+	@echo "x86:       make build | make run | make dev (indexer+daemon+frontend together, Ctrl+C stops all)"
 	@echo "Pi (32-bit armhf):  make build-pi   | make deploy-pi   (PI_HOST=$(PI_HOST))"
 	@echo "Pi (64-bit arm64):  make build-pi64 | make deploy-pi64 (PI_HOST=$(PI_HOST))"
 	@echo "Indexer:   make build-indexer | make run-indexer"
