@@ -1,5 +1,6 @@
 import { ActionIcon, Group, Slider, Stack, Text, ThemeIcon } from '@mantine/core'
 import {
+  IconBrandYoutube,
   IconChevronDown,
   IconMusic,
   IconPlayerPause,
@@ -14,6 +15,7 @@ import {
 import { formatTime } from '../format.js'
 import { albumArtUrl } from '../api.js'
 import { usePlayerControls } from '../hooks/usePlayerControls.js'
+import { isYouTubeUrl } from '../isYouTubeUrl.js'
 
 const ART_SIZE = 280
 
@@ -24,7 +26,7 @@ const ART_SIZE = 280
 // of its actual playback state/handlers with PlayerBar via
 // usePlayerControls — this is a different layout over the same status
 // prop and API calls, not a separate playback implementation.
-function NowPlayingScreen({ status, onClose }) {
+function NowPlayingScreen({ status, onClose, hideVolumeControl }) {
   const {
     showArt,
     setArtFailed,
@@ -82,9 +84,16 @@ function NowPlayingScreen({ status, onClose }) {
         )}
 
         <Stack gap={4} align="center" style={{ maxWidth: '90vw' }}>
-          <Text size="xl" fw={700} truncate="end" ta="center" style={{ maxWidth: '100%' }}>
-            {primaryLine}
-          </Text>
+          <Group gap={6} wrap="nowrap" justify="center" style={{ maxWidth: '100%' }}>
+            <Text size="xl" fw={700} truncate="end" ta="center">
+              {primaryLine}
+            </Text>
+            {isYouTubeUrl(status?.song) && (
+              <span title="From YouTube" style={{ display: 'inline-flex', flexShrink: 0 }}>
+                <IconBrandYoutube size={20} color="var(--mantine-color-red-6)" />
+              </span>
+            )}
+          </Group>
           {status?.artist && (
             <Text size="md" c="dimmed" truncate="end" ta="center" style={{ maxWidth: '100%' }}>
               {status.artist}
@@ -152,25 +161,27 @@ function NowPlayingScreen({ status, onClose }) {
           </ActionIcon>
         </Group>
 
-        <Group gap="xs" wrap="nowrap" w="100%">
-          <ActionIcon
-            variant="subtle"
-            onClick={handleMuteToggle}
-            aria-label={volume > 0 ? 'Mute' : 'Unmute'}
-          >
-            {volume > 0 ? <IconVolume2 size={18} /> : <IconVolumeOff size={18} />}
-          </ActionIcon>
-          <Slider
-            style={{ flex: 1 }}
-            size="sm"
-            value={dragVolume ?? volume}
-            min={0}
-            max={100}
-            onChange={setDragVolume}
-            onChangeEnd={handleVolumeChangeEnd}
-            label={(value) => `${value}%`}
-          />
-        </Group>
+        {!hideVolumeControl && (
+          <Group gap="xs" wrap="nowrap" w="100%">
+            <ActionIcon
+              variant="subtle"
+              onClick={handleMuteToggle}
+              aria-label={volume > 0 ? 'Mute' : 'Unmute'}
+            >
+              {volume > 0 ? <IconVolume2 size={18} /> : <IconVolumeOff size={18} />}
+            </ActionIcon>
+            <Slider
+              style={{ flex: 1 }}
+              size="sm"
+              value={dragVolume ?? volume}
+              min={0}
+              max={100}
+              onChange={setDragVolume}
+              onChangeEnd={handleVolumeChangeEnd}
+              label={(value) => `${value}%`}
+            />
+          </Group>
+        )}
       </Stack>
     </Stack>
   )

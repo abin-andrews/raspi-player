@@ -22,6 +22,7 @@ import (
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/player"
 	"pi-streamer/internal/urlcheck"
+	"pi-streamer/internal/ytdlp"
 )
 
 // downloadTimeout bounds both an on-demand bucket-mode download (in
@@ -31,12 +32,27 @@ import (
 // finite so a truly stuck download doesn't hang forever.
 const downloadTimeout = 2 * time.Minute
 
+// youtubeExtractTimeout is downloadTimeout's counterpart for yt-dlp
+// extraction, which does more than a plain HTTP GET (resolving available
+// formats, picking one, then downloading it, plus ffmpeg post-processing
+// for --embed-metadata) — given more headroom for that extra work on top
+// of the download itself.
+const youtubeExtractTimeout = 3 * time.Minute
+
 // modeResolver implements player.Resolver: depending on the daemon's live-
 // configured playback mode, it either verifies a URL is reachable and
 // streams it directly (config.ModeStream), or downloads it into the local
 // bucket cache first and hands mpd a URL onto streamBaseURL instead
 // (config.ModeBucket) — reusing an already-cached copy via Lookup if one
 // exists rather than re-downloading.
+//
+// A YouTube video URL bypasses that mode choice entirely and always goes
+// through the bucket cache: mpd has no idea what to do with a youtube.com
+// URL under *either* mode (there's no "direct stream" to speak of — it's a
+// video-hosting page, not a media file), so ytdlp (below) extracts its
+// audio-only stream first, the same "mpd can't fetch this on its own, so
+// the daemon does and proxies the bytes" pattern the removed Google Drive
+// integration and ordinary bucket mode both already use.
 //
 // streamBaseURL points at bucketFileServer (below), not a raw filesystem
 // path: mpd only permits `add`-ing a local file to clients connected via
@@ -50,9 +66,14 @@ type modeResolver struct {
 	checker       *urlcheck.Checker
 	cache         *bucket.Store
 	streamBaseURL string
+	ytdlp         *ytdlp.Extractor // nil disables YouTube extraction entirely
 }
 
 func (r *modeResolver) Resolve(url string) (string, error) {
+	if r.ytdlp != nil && ytdlp.IsYouTubeURL(url) {
+		return r.resolveYouTube(url)
+	}
+
 	if r.cfg.Get().Bucket.Mode != config.ModeBucket {
 		if err := r.checker.Check(url); err != nil {
 			return "", fmt.Errorf("unreachable: %w", err)
@@ -68,6 +89,28 @@ func (r *modeResolver) Resolve(url string) (string, error) {
 	path, err := r.cache.Download(ctx, url)
 	if err != nil {
 		return "", fmt.Errorf("download to bucket: %w", err)
+	}
+	return r.streamURL(path), nil
+}
+
+// resolveYouTube extracts url's audio into the bucket cache (reusing an
+// already-extracted copy via Lookup if one exists, exactly like the
+// ordinary bucket-mode path) and hands mpd the same kind of local
+// file-server URL either path produces — Unresolve/prefetch/eviction all
+// already treat every cache entry uniformly regardless of how it got
+// there, so nothing downstream needs to know this one came from yt-dlp
+// rather than a plain HTTP download.
+func (r *modeResolver) resolveYouTube(url string) (string, error) {
+	if path, ok := r.cache.Lookup(url); ok {
+		return r.streamURL(path), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), youtubeExtractTimeout)
+	defer cancel()
+	path, err := r.cache.DownloadVia(ctx, url, func(dir string) (string, error) {
+		return r.ytdlp.ExtractAudio(ctx, url, dir)
+	})
+	if err != nil {
+		return "", fmt.Errorf("extract youtube audio: %w", err)
 	}
 	return r.streamURL(path), nil
 }

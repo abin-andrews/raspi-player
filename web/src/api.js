@@ -68,6 +68,22 @@ export const warmAlbumArt = () => request('POST', '/api/albumart/warm')
 // available for a one-off check.
 export const getJobs = () => request('GET', '/api/jobs')
 
+// Candidate Title/Artist/Album matches for query, via the same
+// MusicBrainz lookup the album art fallback already uses (see
+// refreshAlbumArt) — surfaced in the Library edit form as suggestions to
+// pick from, never applied automatically. Returns { suggestions: [...] }.
+export const suggestMetadata = (query) => request('POST', '/api/albumart/suggest', { query })
+
+// Sets/clears a custom album art fallback, fetched from any URL that
+// serves an image (not necessarily one the daemon otherwise knows how to
+// find art from) — scope is "track" (key: the track's URL), "album", or
+// "artist" (key: the album/artist name). Once set, it's used ahead of
+// (track scope) or as a fallback behind (album/artist scope)
+// auto-resolution until cleared — see the album art architecture notes.
+export const setCustomArt = (scope, key, imageUrl) =>
+  request('POST', '/api/albumart/custom', { scope, key, imageUrl })
+export const clearCustomArt = (scope, key) => request('DELETE', '/api/albumart/custom', { scope, key })
+
 // Opens a WebSocket to the daemon's live push feed. Calls onMessage with
 // each parsed {type, data} envelope as it arrives (type is "status" or
 // "downloads" — see cmd/pi-streamer/main.go's wsMessage/useDaemonSocket.js,

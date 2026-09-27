@@ -21,10 +21,14 @@ all: build
 
 ## Common tasks (architecture-independent)
 
-# Debian/Ubuntu dev machine setup: Go toolchain + mpd/mpc for local testing.
+# Debian/Ubuntu dev machine setup: Go toolchain + mpd/mpc for local testing,
+# plus yt-dlp + ffmpeg for extracting audio from YouTube URLs (internal/
+# ytdlp) — ffmpeg is yt-dlp's own dependency for --embed-metadata and for
+# some audio-only formats' post-processing, not something this daemon
+# invokes directly itself.
 install-deps:
 	sudo apt-get update
-	sudo apt-get install -y golang-go mpd mpc
+	sudo apt-get install -y golang-go mpd mpc yt-dlp ffmpeg
 
 test:
 	go test ./...
@@ -76,10 +80,11 @@ deploy-pi: build-pi web-build
 deploy-pi64: build-pi64 web-build
 	PI_HOST=$(PI_HOST) PI_PATH=$(PI_PATH) ./scripts/deploy-pi.sh arm64
 
-# One-time Pi-side package setup (mpd/mpc) — audio_output still needs a
-# manual edit to /etc/mpd.conf afterwards (hardware-specific, see CLAUDE.md).
+# One-time Pi-side package setup (mpd/mpc, yt-dlp/ffmpeg for YouTube URL
+# support) — audio_output still needs a manual edit to /etc/mpd.conf
+# afterwards (hardware-specific, see CLAUDE.md).
 install-deps-pi:
-	ssh $(PI_HOST) 'sudo apt-get update && sudo apt-get install -y mpd mpc'
+	ssh $(PI_HOST) 'sudo apt-get update && sudo apt-get install -y mpd mpc yt-dlp ffmpeg'
 
 ## Search indexer (runs on a separate, more capable machine — not the Pi)
 

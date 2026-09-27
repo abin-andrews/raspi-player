@@ -172,3 +172,76 @@ func TestPutOverwritesExistingEntry(t *testing.T) {
 		t.Errorf("Lookup() after overwrite = %q, %v, %v, want %q, true, true", gotName, gotHasArt, known, name)
 	}
 }
+
+func TestPutCustomThenLookupAndIsCustom(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jpegLike := []byte("\xff\xd8\xff\xe0fakejpegbytes")
+	name, err := s.PutCustom("custom-album:Rumours", jpegLike)
+	if err != nil {
+		t.Fatalf("PutCustom() error = %v, want nil", err)
+	}
+	if name == "" {
+		t.Fatal("PutCustom() returned an empty filename")
+	}
+
+	gotName, gotHasArt, known := s.Lookup("custom-album:Rumours")
+	if !known || !gotHasArt || gotName != name {
+		t.Errorf("Lookup() = %q, %v, %v, want %q, true, true", gotName, gotHasArt, known, name)
+	}
+	if !s.IsCustom("custom-album:Rumours") {
+		t.Error("IsCustom() = false, want true after PutCustom")
+	}
+
+	if _, _, err := s.Put("https://example.com/a.mp3", jpegLike); err != nil {
+		t.Fatal(err)
+	}
+	if s.IsCustom("https://example.com/a.mp3") {
+		t.Error("IsCustom() = true for an entry set via Put, want false")
+	}
+}
+
+func TestPutCustomRejectsEmptyData(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutCustom("custom-album:Rumours", nil); err == nil {
+		t.Error("PutCustom(nil): want error, got nil — custom art must not silently record a negative result")
+	}
+}
+
+func TestRemoveDeletesEntryAndFile(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := s.PutCustom("custom-artist:Fleetwood Mac", []byte("\xff\xd8\xff\xe0jpeg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Remove("custom-artist:Fleetwood Mac"); err != nil {
+		t.Fatalf("Remove() error = %v, want nil", err)
+	}
+
+	if _, _, known := s.Lookup("custom-artist:Fleetwood Mac"); known {
+		t.Error("Lookup() after Remove: want known=false")
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir(), name)); !os.IsNotExist(err) {
+		t.Errorf("file %q still exists after Remove()", name)
+	}
+}
+
+func TestRemoveOfUnknownKeyIsNotAnError(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("never-set"); err != nil {
+		t.Errorf("Remove() on an unknown key: error = %v, want nil", err)
+	}
+}

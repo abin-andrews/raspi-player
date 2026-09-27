@@ -14,15 +14,39 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"pi-streamer/internal/ytdlp"
 )
 
 // Normalize trims whitespace and lowercases/canonicalizes the scheme, host,
 // and default port of rawURL, returning an error if rawURL is empty or not
 // a parseable URL.
+//
+// A recognized YouTube video URL is a deliberate exception to the "never
+// touch path/query" rule above: every shape ytdlp.VideoID recognizes (an
+// ordinary watch link, a youtu.be share link, an embed/Shorts/live link,
+// each with or without extra query params — a share link's "?si=..."
+// tracking token, a timestamp, a playlist reference) identifies the exact
+// same video, and a real "copy link" button routinely produces a
+// different one of these for what is, for every purpose this URL is used
+// for (the search index, the bucket cache, favorites/playlists/history,
+// album art, and internal/player's per-URL enrichment cache), the
+// identical track. Without collapsing them here, the same video pasted via
+// two different link styles — or the same one shared twice, picking up a
+// different tracking token each time — would be treated as two unrelated
+// tracks throughout the whole app: two bucket-cache entries (so the audio
+// gets extracted twice), two Library rows, two enrichment-cache lookups,
+// etc. Collapses to "https://www.youtube.com/watch?v=<id>" — the most
+// widely recognized form, deliberately dropping every other query
+// parameter, since none of them affect the video's own identity.
 func Normalize(rawURL string) (string, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return "", fmt.Errorf("urlnorm: empty URL")
+	}
+
+	if id, ok := ytdlp.VideoID(trimmed); ok {
+		return "https://www.youtube.com/watch?v=" + id, nil
 	}
 
 	u, err := url.Parse(trimmed)

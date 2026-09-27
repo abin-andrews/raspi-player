@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -151,6 +153,89 @@ func (f *Fetcher) fetchFrontCover(ctx context.Context, mbid string) ([]byte, err
 		return nil, fmt.Errorf("coverart: read archive response: %w", err)
 	}
 	return data, nil
+}
+
+// MetadataSuggestion is one candidate Title/Artist/Album match returned by
+// SearchMetadata, for a human to confirm/pick rather than applying blindly
+// — MusicBrainz's free-text search returns its best guesses, not
+// guaranteed-correct matches.
+type MetadataSuggestion struct {
+	Title  string
+	Artist string
+	Album  string
+}
+
+// SearchMetadata queries MusicBrainz's recording search for candidates
+// matching query (typically whatever's already typed into an edit form, or
+// a name derived from the track's URL when nothing has been entered yet)
+// and returns up to limit Title/Artist/Album suggestions, best release
+// match first. An empty query is rejected up front, same reasoning as
+// Fetch's own required-fields check — MusicBrainz's own search would just
+// as reliably return nothing useful for it. Returns an empty slice (not an
+// error) if the search itself succeeded but simply found nothing, the
+// common case for anything not in MusicBrainz's database.
+func (f *Fetcher) SearchMetadata(ctx context.Context, query string, limit int) ([]MetadataSuggestion, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("coverart: query is required")
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+
+	f.waitForRateLimit()
+
+	values := url.Values{}
+	values.Set("query", query)
+	values.Set("fmt", "json")
+	values.Set("limit", strconv.Itoa(limit))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.mbBaseURL()+"/recording/?"+values.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("coverart: build metadata search request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := f.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("coverart: metadata search request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("coverart: metadata search: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Recordings []struct {
+			Title        string `json:"title"`
+			ArtistCredit []struct {
+				Name string `json:"name"`
+			} `json:"artist-credit"`
+			Releases []struct {
+				Title string `json:"title"`
+			} `json:"releases"`
+		} `json:"recordings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("coverart: decode metadata search response: %w", err)
+	}
+
+	suggestions := make([]MetadataSuggestion, 0, len(result.Recordings))
+	for _, rec := range result.Recordings {
+		var artist string
+		if len(rec.ArtistCredit) > 0 {
+			artist = rec.ArtistCredit[0].Name
+		}
+		var album string
+		if len(rec.Releases) > 0 {
+			album = rec.Releases[0].Title
+		}
+		suggestions = append(suggestions, MetadataSuggestion{Title: rec.Title, Artist: artist, Album: album})
+	}
+	return suggestions, nil
 }
 
 func (f *Fetcher) waitForRateLimit() {

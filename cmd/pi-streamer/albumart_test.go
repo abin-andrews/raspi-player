@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"pi-streamer/internal/api"
 	"pi-streamer/internal/artstore"
+	"pi-streamer/internal/coverart"
 	"pi-streamer/internal/indexer"
 	"pi-streamer/internal/jobs"
 )
@@ -30,12 +34,39 @@ func (f *fakeAlbumArtFetcher) AlbumArt(url string) ([]byte, error) {
 type fakeCoverArtFetcher struct {
 	data  map[string][]byte // "artist|album" -> art bytes
 	calls []string
+
+	suggestions  map[string][]coverart.MetadataSuggestion // query -> results
+	suggestErr   error
+	suggestCalls []string
 }
 
 func (f *fakeCoverArtFetcher) Fetch(ctx context.Context, artist, album string) ([]byte, error) {
 	key := artist + "|" + album
 	f.calls = append(f.calls, key)
 	return f.data[key], nil
+}
+
+// fakeThumbnailFetcher is an in-memory thumbnailFetcher for tests.
+type fakeThumbnailFetcher struct {
+	data  map[string][]byte // youtube url -> thumbnail bytes
+	err   error
+	calls []string
+}
+
+func (f *fakeThumbnailFetcher) Fetch(ctx context.Context, youtubeURL string) ([]byte, error) {
+	f.calls = append(f.calls, youtubeURL)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.data[youtubeURL], nil
+}
+
+func (f *fakeCoverArtFetcher) SearchMetadata(ctx context.Context, query string, limit int) ([]coverart.MetadataSuggestion, error) {
+	f.suggestCalls = append(f.suggestCalls, query)
+	if f.suggestErr != nil {
+		return nil, f.suggestErr
+	}
+	return f.suggestions[query], nil
 }
 
 // fakeLibraryLister is an in-memory libraryLister for tests.
@@ -149,6 +180,75 @@ func TestResolveDoesNotCacheTransientError(t *testing.T) {
 	}
 	if len(mpd.calls) != 2 {
 		t.Errorf("mpd.calls = %v, want 2 (a transient error must never be cached)", mpd.calls)
+	}
+}
+
+func TestResolveUsesYouTubeThumbnailInsteadOfMPDForYouTubeURLs(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t)
+	thumbs := &fakeThumbnailFetcher{data: map[string][]byte{
+		"https://youtu.be/abc123XYZ90": []byte("\xff\xd8\xff\xe0thumbnailbytes"),
+	}}
+	a.thumbnails = thumbs
+
+	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if !ok || path == "" {
+		t.Fatalf("Resolve() = %q, %v, want a non-empty path and ok=true from the thumbnail", path, ok)
+	}
+	if len(mpd.calls) != 0 {
+		t.Errorf("mpd.calls = %v, want none — a YouTube URL should never reach mpd.AlbumArt", mpd.calls)
+	}
+	if len(thumbs.calls) != 1 || thumbs.calls[0] != "https://youtu.be/abc123XYZ90" {
+		t.Errorf("thumbs.calls = %v, want one entry for the submitted YouTube URL", thumbs.calls)
+	}
+}
+
+func TestResolveFallsThroughToMPDForYouTubeURLsWithoutAThumbnailFetcher(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t) // a.thumbnails left nil, as newTestArtAdapter leaves it
+	mpd.data["https://youtu.be/abc123XYZ90"] = []byte("\xff\xd8\xff\xe0mpdbytes")
+
+	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if !ok || path == "" {
+		t.Fatalf("Resolve() = %q, %v, want the ordinary mpd path used with no thumbnail fetcher configured", path, ok)
+	}
+	if len(mpd.calls) != 1 {
+		t.Errorf("mpd.calls = %v, want exactly one — the ordinary path should still run", mpd.calls)
+	}
+}
+
+func TestResolvePropagatesThumbnailFetcherError(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	a.thumbnails = &fakeThumbnailFetcher{err: errors.New("network unreachable")}
+
+	if _, _, err := a.Resolve("https://youtu.be/abc123XYZ90", "", ""); err == nil {
+		t.Error("Resolve(): want error when the thumbnail fetcher fails, got nil")
+	}
+}
+
+func TestResolveCachesConfirmedNoThumbnail(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	thumbs := &fakeThumbnailFetcher{data: map[string][]byte{}} // no entry -> nil bytes, confirmed no art
+	a.thumbnails = thumbs
+
+	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if ok || path != "" {
+		t.Errorf("Resolve() = %q, %v, want ok=false for a confirmed-missing thumbnail", path, ok)
+	}
+
+	// A second Resolve for the same URL must hit the cache, not fetch again.
+	if _, _, err := a.Resolve("https://youtu.be/abc123XYZ90", "", ""); err != nil {
+		t.Fatalf("Resolve() (second call) error = %v, want nil", err)
+	}
+	if len(thumbs.calls) != 1 {
+		t.Errorf("thumbs.calls = %v, want exactly 1 (cached after the first confirmed-no-art result)", thumbs.calls)
 	}
 }
 
@@ -275,5 +375,220 @@ func TestWarmSkipsAlreadyKnownEntries(t *testing.T) {
 
 	if len(mpd.calls) != 0 {
 		t.Errorf("mpd.calls = %v, want none — warm should skip a URL already resolved", mpd.calls)
+	}
+}
+
+func TestSuggestReturnsCandidatesFromCoverArtFetcher(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	cover := &fakeCoverArtFetcher{suggestions: map[string][]coverart.MetadataSuggestion{
+		"some query": {{Title: "Track One", Artist: "Some Artist", Album: "Some Album"}},
+	}}
+	a.coverArt = cover
+
+	got, err := a.Suggest("some query")
+	if err != nil {
+		t.Fatalf("Suggest() error = %v, want nil", err)
+	}
+	want := []api.MetadataSuggestion{{Title: "Track One", Artist: "Some Artist", Album: "Some Album"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("Suggest() = %+v, want %+v", got, want)
+	}
+	if len(cover.suggestCalls) != 1 || cover.suggestCalls[0] != "some query" {
+		t.Errorf("suggestCalls = %v, want one entry for the submitted query", cover.suggestCalls)
+	}
+}
+
+func TestSuggestReturnsNilWithoutACoverArtFetcherConfigured(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t) // a.coverArt left nil, as newTestArtAdapter leaves it
+
+	got, err := a.Suggest("anything")
+	if err != nil {
+		t.Fatalf("Suggest() error = %v, want nil", err)
+	}
+	if got != nil {
+		t.Errorf("Suggest() = %v, want nil with no fallback source configured", got)
+	}
+}
+
+func TestSuggestPropagatesFetcherError(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	cover := &fakeCoverArtFetcher{suggestErr: errors.New("musicbrainz unreachable")}
+	a.coverArt = cover
+
+	if _, err := a.Suggest("anything"); err == nil {
+		t.Error("Suggest(): want error when the fetcher fails, got nil")
+	}
+}
+
+func fakeImageServer(t *testing.T, body []byte) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestSetCustomArtForTrackScope(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0customjpeg"))
+
+	status, err := a.SetCustomArt("track", "http://example.com/a.mp3", srv.URL)
+	if err != nil {
+		t.Fatalf("SetCustomArt() error = %v, want nil", err)
+	}
+	if !status.HasArt || status.Path == "" {
+		t.Fatalf("SetCustomArt() = %+v, want HasArt=true and a non-empty path", status)
+	}
+	if !a.store.IsCustom("http://example.com/a.mp3") {
+		t.Error("IsCustom() = false for the track key, want true after SetCustomArt")
+	}
+}
+
+func TestSetCustomArtRejectsUnknownScope(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0customjpeg"))
+
+	if _, err := a.SetCustomArt("song", "whatever", srv.URL); err == nil {
+		t.Error("SetCustomArt(\"song\", ...): want error for an unknown scope, got nil")
+	}
+}
+
+func TestSetCustomArtPropagatesFetchError(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	if _, err := a.SetCustomArt("track", "http://example.com/a.mp3", srv.URL); err == nil {
+		t.Error("SetCustomArt(): want error on a non-200 fetch, got nil")
+	}
+}
+
+func TestResolveTrackCustomArtWinsEvenOnRefresh(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0customjpeg"))
+	mpd.data["http://example.com/a.mp3"] = []byte("\xff\xd8\xff\xe0mpdjpeg")
+
+	if _, err := a.SetCustomArt("track", "http://example.com/a.mp3", srv.URL); err != nil {
+		t.Fatalf("SetCustomArt: %v", err)
+	}
+	mpd.calls = nil
+
+	path1, ok, err := a.Resolve("http://example.com/a.mp3", "", "")
+	if err != nil || !ok {
+		t.Fatalf("Resolve() = %q, %v, %v, want the custom path with no error", path1, ok, err)
+	}
+	// Refresh (force=true) would normally always bypass the cache and
+	// re-resolve — custom art must be the one exception.
+	path2, ok, err := a.Refresh("http://example.com/a.mp3", "", "")
+	if err != nil || !ok || path2 != path1 {
+		t.Fatalf("Refresh() = %q, %v, %v, want the same custom path (%q) unchanged", path2, ok, err, path1)
+	}
+	if len(mpd.calls) != 0 {
+		t.Errorf("mpd.calls = %v, want none — mpd should never be consulted once custom art is set", mpd.calls)
+	}
+}
+
+func TestResolveFallsBackToCustomAlbumArtWhenTrackHasNone(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t) // mpd has nothing for this url, no coverArt configured
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0albumjpeg"))
+	if _, err := a.SetCustomArt("album", "Rumours", srv.URL); err != nil {
+		t.Fatalf("SetCustomArt: %v", err)
+	}
+
+	path, ok, err := a.Resolve("http://example.com/a.mp3", "Fleetwood Mac", "Rumours")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if !ok || path == "" {
+		t.Fatalf("Resolve() = %q, %v, want the custom album fallback used", path, ok)
+	}
+	if len(mpd.calls) != 1 {
+		t.Errorf("mpd.calls = %v, want exactly 1 — auto-resolution should still be tried first", mpd.calls)
+	}
+}
+
+func TestResolveFallsBackToCustomArtistArtWhenNoAlbumFallback(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0artistjpeg"))
+	if _, err := a.SetCustomArt("artist", "Fleetwood Mac", srv.URL); err != nil {
+		t.Fatalf("SetCustomArt: %v", err)
+	}
+
+	path, ok, err := a.Resolve("http://example.com/a.mp3", "Fleetwood Mac", "Rumours")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if !ok || path == "" {
+		t.Fatalf("Resolve() = %q, %v, want the custom artist fallback used", path, ok)
+	}
+}
+
+func TestResolveAlbumFallbackTakesPriorityOverArtistFallback(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	albumSrv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0albumjpeg"))
+	artistSrv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0artistjpeg"))
+	if _, err := a.SetCustomArt("album", "Rumours", albumSrv.URL); err != nil {
+		t.Fatalf("SetCustomArt album: %v", err)
+	}
+	if _, err := a.SetCustomArt("artist", "Fleetwood Mac", artistSrv.URL); err != nil {
+		t.Fatalf("SetCustomArt artist: %v", err)
+	}
+
+	path, ok, err := a.Resolve("http://example.com/a.mp3", "Fleetwood Mac", "Rumours")
+	if err != nil || !ok {
+		t.Fatalf("Resolve() = %q, %v, %v, want a resolved path with no error", path, ok, err)
+	}
+
+	albumPath, _, _ := a.Resolve("http://example.com/b.mp3", "", "Rumours")
+	if path != albumPath {
+		t.Errorf("Resolve() path = %q, want the album fallback's path (%q), not the artist one", path, albumPath)
+	}
+}
+
+func TestResolveWithNoCustomFallbackStillRecordsConfirmedNoArt(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t) // mpd has nothing, no coverArt, no custom fallback set
+	_ = mpd
+
+	path, ok, err := a.Resolve("http://example.com/a.mp3", "Fleetwood Mac", "Rumours")
+	if err != nil {
+		t.Fatalf("Resolve() error = %v, want nil", err)
+	}
+	if ok || path != "" {
+		t.Errorf("Resolve() = %q, %v, want ok=false with nothing to fall back to", path, ok)
+	}
+}
+
+func TestClearCustomArtRevertsTrackToAutoResolution(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0customjpeg"))
+	mpd.data["http://example.com/a.mp3"] = []byte("\xff\xd8\xff\xe0mpdjpeg")
+
+	if _, err := a.SetCustomArt("track", "http://example.com/a.mp3", srv.URL); err != nil {
+		t.Fatalf("SetCustomArt: %v", err)
+	}
+	if err := a.ClearCustomArt("track", "http://example.com/a.mp3"); err != nil {
+		t.Fatalf("ClearCustomArt: %v", err)
+	}
+
+	if a.store.IsCustom("http://example.com/a.mp3") {
+		t.Error("IsCustom() = true after ClearCustomArt, want false")
+	}
+
+	path, ok, err := a.Resolve("http://example.com/a.mp3", "", "")
+	if err != nil || !ok || path == "" {
+		t.Fatalf("Resolve() after clear = %q, %v, %v, want mpd's own art resolved", path, ok, err)
+	}
+	if len(mpd.calls) != 1 {
+		t.Errorf("mpd.calls = %v, want exactly 1 — auto-resolution should run again after clearing", mpd.calls)
+	}
+}
+
+func TestClearCustomArtOnUnsetKeyIsNotAnError(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	if err := a.ClearCustomArt("album", "Never Set"); err != nil {
+		t.Errorf("ClearCustomArt() on an unset key: error = %v, want nil", err)
 	}
 }

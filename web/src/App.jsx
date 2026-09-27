@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   ActionIcon,
   AppShell,
@@ -13,6 +13,7 @@ import {
   Tabs,
 } from '@mantine/core'
 import { IconBooks, IconDownload, IconLoader2, IconPlaylist, IconSettings } from '@tabler/icons-react'
+import { getConfig } from './api.js'
 import { useDaemonSocket } from './hooks/useDaemonSocket.js'
 import { useHashTab } from './hooks/useHashTab.js'
 import Queue from './components/Queue.jsx'
@@ -41,6 +42,29 @@ function App() {
   const [tab, setTab] = useHashTab(TABS, 'library')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [nowPlayingOpen, setNowPlayingOpen] = useState(false)
+
+  // The daemon's own config (currently just ui.hideVolumeControl is read
+  // here) — fetched once up front, and again whenever Settings closes,
+  // since that's the only place it can change. Not pushed over /ws like
+  // status/downloads/jobs: it changes rarely (a user toggling a setting),
+  // so a fetch-on-close is simpler than adding a fourth WS envelope type
+  // for something this infrequent.
+  const [uiConfig, setUiConfig] = useState({})
+
+  function refreshUiConfig() {
+    getConfig()
+      .then((cfg) => setUiConfig(cfg?.ui ?? {}))
+      .catch(() => {})
+  }
+
+  useEffect(() => {
+    refreshUiConfig()
+  }, [])
+
+  function closeSettings() {
+    setSettingsOpen(false)
+    refreshUiConfig()
+  }
 
   // Don't render the real UI until the WebSocket has delivered current
   // state: this is what makes a reload while something's playing seamless
@@ -79,7 +103,11 @@ function App() {
               this "top middle" rather than just left-aligned next to
               whatever happens to be on the left. */}
           <Group h="100%" px="md" wrap="nowrap" gap="xs">
-            <div style={{ flex: 1 }} />
+            <Group style={{ flex: 1 }} wrap="nowrap">
+              <Text fw={700} size="sm" style={{ whiteSpace: 'nowrap' }}>
+                Pi Streamer
+              </Text>
+            </Group>
             <Tabs.List>
               <Tabs.Tab value="library" leftSection={<IconBooks size={16} />}>
                 Library
@@ -140,13 +168,17 @@ function App() {
         </AppShell.Main>
 
         <AppShell.Footer>
-          <PlayerBar status={status} onExpand={() => setNowPlayingOpen(true)} />
+          <PlayerBar
+            status={status}
+            onExpand={() => setNowPlayingOpen(true)}
+            hideVolumeControl={uiConfig.hideVolumeControl}
+          />
         </AppShell.Footer>
       </AppShell>
 
       <Modal
         opened={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={closeSettings}
         title="Settings"
         fullScreen
         transitionProps={{ transition: 'slide-left' }}
@@ -164,7 +196,11 @@ function App() {
         withCloseButton={false}
         transitionProps={{ transition: 'slide-up' }}
       >
-        <NowPlayingScreen status={status} onClose={() => setNowPlayingOpen(false)} />
+        <NowPlayingScreen
+          status={status}
+          onClose={() => setNowPlayingOpen(false)}
+          hideVolumeControl={uiConfig.hideVolumeControl}
+        />
       </Modal>
     </Tabs>
   )

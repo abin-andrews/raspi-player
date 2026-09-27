@@ -173,6 +173,31 @@ type Art interface {
 	// pre-resolving art for the whole library, so viewing it for the
 	// first time doesn't have to.
 	Warm()
+	// Suggest returns candidate Title/Artist/Album matches for query,
+	// via the same MusicBrainz lookup Resolve/Refresh already use as an
+	// album art fallback — surfaced in the Library edit form as
+	// suggestions a user can pick from, not applied automatically.
+	Suggest(query string) ([]MetadataSuggestion, error)
+	// SetCustomArt fetches imageURL (any URL serving an image) and
+	// records it as scope's ("track"/"album"/"artist") custom art for
+	// key (a track's URL, or an album/artist name) — an explicit
+	// fallback for when auto-resolution doesn't find the right thing, or
+	// anything at all. Once set, Resolve/Refresh treat it as
+	// authoritative for that scope until ClearCustomArt reverts it.
+	SetCustomArt(scope, key, imageURL string) (ArtStatus, error)
+	// ClearCustomArt removes scope/key's custom art, reverting to
+	// whatever auto-resolution finds. Not an error if nothing was set.
+	ClearCustomArt(scope, key string) error
+}
+
+// MetadataSuggestion is internal/api's own copy of coverart.
+// MetadataSuggestion's shape (same "own copy, no direct import" pattern as
+// ArtStatus/BucketStatus/Job below) — one candidate Title/Artist/Album
+// match for a track being edited.
+type MetadataSuggestion struct {
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Album  string `json:"album"`
 }
 
 // Job mirrors internal/jobs.Job's shape at the API layer, the same
@@ -211,6 +236,9 @@ func NewRouter(p Player, cfg Config, o Oled, b Bucket, art Art, j Jobs) http.Han
 	mux.HandleFunc("POST /api/albumart/query", handleAlbumArtQuery(art))
 	mux.HandleFunc("POST /api/albumart/refresh", handleRefreshAlbumArt(art))
 	mux.HandleFunc("POST /api/albumart/warm", handleWarmAlbumArt(art))
+	mux.HandleFunc("POST /api/albumart/suggest", handleSuggestMetadata(art))
+	mux.HandleFunc("POST /api/albumart/custom", handleSetCustomArt(art))
+	mux.HandleFunc("DELETE /api/albumart/custom", handleClearCustomArt(art))
 	mux.HandleFunc("GET /api/jobs", handleListJobs(j))
 	mux.HandleFunc("POST /api/next", handleNext(p))
 	mux.HandleFunc("POST /api/previous", handlePrevious(p))

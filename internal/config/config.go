@@ -13,11 +13,25 @@ import (
 	"sync"
 )
 
+// DefaultElapsedUpdateIntervalSeconds is applied whenever
+// OLED.ElapsedUpdateIntervalSeconds is zero (an unconfigured Config, or
+// one predating that field) — matches the original hardcoded behavior of
+// pushing a fresh elapsed-time update to the display every second while
+// playing.
+const DefaultElapsedUpdateIntervalSeconds = 1
+
 // OLED holds the Arduino display's serial connection settings. An empty
 // Port means "not configured" — the daemon simply doesn't drive a display.
 type OLED struct {
 	Port string `json:"port"`
 	Baud int    `json:"baud"`
+	// ElapsedUpdateIntervalSeconds controls how often (while playing) the
+	// daemon pushes a fresh elapsed-time update to the display — the
+	// display's own progress bar/countdown otherwise only moves once per
+	// push, not continuously, so a larger interval trades off how
+	// frequently it visibly advances against how much serial traffic it
+	// takes to do so. Zero means DefaultElapsedUpdateIntervalSeconds.
+	ElapsedUpdateIntervalSeconds int `json:"elapsedUpdateIntervalSeconds"`
 }
 
 // PlaybackMode selects how a submitted URL is actually handed to mpd.
@@ -80,10 +94,25 @@ type Bucket struct {
 	MinFreeMB int `json:"minFreeMb"`
 }
 
+// UI holds settings for the web frontend's own behavior — distinct from
+// OLED/Bucket, which are daemon-side subsystems; UI's fields are simply
+// read back by the frontend (GET /api/config, same as the others) and
+// applied client-side, the daemon itself does nothing with them.
+type UI struct {
+	// HideVolumeControl hides the volume slider in PlayerBar/
+	// NowPlayingScreen — e.g. for a setup that always runs at a fixed
+	// system/amp volume, where the on-screen control just gets in the
+	// way. Named so the zero value (false, an unconfigured Config, or
+	// one predating this field) preserves the original behavior: shown
+	// by default.
+	HideVolumeControl bool `json:"hideVolumeControl"`
+}
+
 // Config is the full set of daemon settings persisted to disk.
 type Config struct {
 	OLED   OLED   `json:"oled"`
 	Bucket Bucket `json:"bucket"`
+	UI     UI     `json:"ui"`
 }
 
 // AllowedBauds are the serial baud rates the daemon will accept for the

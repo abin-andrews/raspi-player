@@ -708,6 +708,114 @@ func TestQueueLeavesRealTitleAlone(t *testing.T) {
 	}
 }
 
+// TestQueueEnrichesTitleAndArtistFromIndexOnceLookupCompletes covers the
+// exact gap "queue should have the same logic as track for the title"
+// pointed at: Status already overrode mpd's tag/URL-derived fallback with
+// the search index's value (see enrichStatus), but Queue previously had no
+// such override at all — just mpd's own tag or deriveTitleFromURL, which
+// produces useless results for e.g. a bare YouTube watch link (its path
+// is just "/watch").
+func TestQueueEnrichesTitleAndArtistFromIndexOnceLookupCompletes(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	_ = mpd.Add("https://youtu.be/abc123XYZ90") // no Title tag, mirrors an untagged/YouTube-sourced file
+	idx := &fakeIndexer{
+		indexed: []indexer.Result{
+			{URL: "https://youtu.be/abc123XYZ90", Title: "Real Video Title", Artist: "Real Channel"},
+		},
+		getCh: make(chan struct{}, 4),
+	}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	// First call kicks off the lookup in the background and falls back to
+	// the URL-derived title in the meantime — it must never block Queue on
+	// the indexer's response time.
+	queue, err := p.Queue()
+	if err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	if len(queue) != 1 || queue[0].Title == "Real Video Title" {
+		t.Errorf("first Queue() = %+v, want the URL-derived fallback (enrichment hasn't resolved yet)", queue)
+	}
+
+	waitForGet(t, idx)
+
+	queue, err = p.Queue()
+	if err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	if len(queue) != 1 {
+		t.Fatalf("Queue() = %v, want one entry", queue)
+	}
+	if queue[0].Title != "Real Video Title" {
+		t.Errorf("Queue[0].Title = %q, want the index's title to win over the URL-derived fallback", queue[0].Title)
+	}
+	if queue[0].Artist != "Real Channel" {
+		t.Errorf("Queue[0].Artist = %q, want the index's artist", queue[0].Artist)
+	}
+}
+
+func TestQueueEnrichmentCachesPerURLAcrossMultipleCalls(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	_ = mpd.Add("https://youtu.be/abc123XYZ90")
+	idx := &fakeIndexer{
+		indexed: []indexer.Result{{URL: "https://youtu.be/abc123XYZ90", Title: "Real Video Title"}},
+		getCh:   make(chan struct{}, 4),
+	}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if _, err := p.Queue(); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	waitForGet(t, idx)
+
+	for i := 0; i < 5; i++ {
+		if _, err := p.Queue(); err != nil {
+			t.Fatalf("Queue: %v", err)
+		}
+	}
+
+	idx.mu.Lock()
+	got := idx.getCalls
+	idx.mu.Unlock()
+	if got != 1 {
+		t.Errorf("Get calls = %d, want exactly 1 (one lookup per URL, not one per Queue call)", got)
+	}
+}
+
+func TestQueueEnrichmentHandlesMultipleDistinctTracksIndependently(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	_ = mpd.Add("https://youtu.be/aaaaaaaaaaa")
+	_ = mpd.Add("https://youtu.be/bbbbbbbbbbb")
+	idx := &fakeIndexer{
+		indexed: []indexer.Result{
+			{URL: "https://youtu.be/aaaaaaaaaaa", Title: "First Video"},
+			{URL: "https://youtu.be/bbbbbbbbbbb", Title: "Second Video"},
+		},
+		getCh: make(chan struct{}, 4),
+	}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if _, err := p.Queue(); err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	waitForGet(t, idx)
+	waitForGet(t, idx)
+
+	queue, err := p.Queue()
+	if err != nil {
+		t.Fatalf("Queue: %v", err)
+	}
+	if len(queue) != 2 {
+		t.Fatalf("Queue() = %v, want 2 entries", queue)
+	}
+	if queue[0].Title != "First Video" {
+		t.Errorf("queue[0].Title = %q, want %q", queue[0].Title, "First Video")
+	}
+	if queue[1].Title != "Second Video" {
+		t.Errorf("queue[1].Title = %q, want %q", queue[1].Title, "Second Video")
+	}
+}
+
 func TestStatusFillsInTitleWhenMPDHasNone(t *testing.T) {
 	p, mpd, _ := newTestPlayer()
 	mpd.Song = "https://example.com/download/My_Cool-Track.mp3"
@@ -1168,6 +1276,37 @@ func TestPlayURLNormalizesCaseVariantsToTheSameHistoryEntry(t *testing.T) {
 	}
 	if hist[0].URL != hist[1].URL {
 		t.Errorf("History URLs = %q, %q, want both normalized to the same canonical URL", hist[0].URL, hist[1].URL)
+	}
+}
+
+// TestPlayURLNormalizesYouTubeURLShapesToTheSameHistoryEntry covers the
+// same "different formats, same video, same identity" request as the
+// urlnorm-level tests, but end to end through PlayURL — proving the whole
+// point of collapsing at normalizeURL's level: everything downstream
+// (history here; the bucket cache/album art/search index/enrichment cache
+// elsewhere) automatically shares one identity for the same video however
+// it was pasted in, with no extra plumbing needed at any of those call
+// sites.
+func TestPlayURLNormalizesYouTubeURLShapesToTheSameHistoryEntry(t *testing.T) {
+	p, _, st := newTestPlayer()
+
+	if err := p.PlayURL("https://youtu.be/abc123XYZ90?si=someTrackingToken12"); err != nil {
+		t.Fatalf("PlayURL: %v", err)
+	}
+	if err := p.PlayURL("https://www.youtube.com/watch?v=abc123XYZ90&t=42s"); err != nil {
+		t.Fatalf("PlayURL: %v", err)
+	}
+
+	hist, err := st.History(0)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("History len = %d, want 2 (both plays recorded, each history entry is its own event)", len(hist))
+	}
+	want := "https://www.youtube.com/watch?v=abc123XYZ90"
+	if hist[0].URL != want || hist[1].URL != want {
+		t.Errorf("History URLs = %q, %q, want both collapsed to %q", hist[0].URL, hist[1].URL, want)
 	}
 }
 

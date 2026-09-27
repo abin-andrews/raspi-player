@@ -24,6 +24,7 @@ import (
 	"pi-streamer/internal/store"
 	"pi-streamer/internal/urlcheck"
 	"pi-streamer/internal/ws"
+	"pi-streamer/internal/ytdlp"
 )
 
 // safeGo runs fn in a new goroutine, recovering any panic so a bug in a
@@ -60,6 +61,9 @@ func main() {
 			"doesn't use), so it fetches from here over plain HTTP instead")
 	artDir := flag.String("art-dir", "art-cache",
 		"directory for resolved album art, served back out as static files at /art/ — see internal/artstore")
+	ytdlpPath := flag.String("ytdlp-path", "",
+		"path to the yt-dlp executable for extracting audio from YouTube URLs — empty resolves \"yt-dlp\" "+
+			"via PATH; a submitted YouTube URL simply fails to play if yt-dlp isn't installed at all")
 	flag.Parse()
 
 	mpdConn, err := mpdclient.Dial("tcp", *mpdAddr)
@@ -96,9 +100,10 @@ func main() {
 		checker:       &urlcheck.Checker{},
 		cache:         cache,
 		streamBaseURL: "http://" + *bucketStreamAddr,
+		ytdlp:         &ytdlp.Extractor{BinaryPath: *ytdlpPath},
 	}
 	archiver := &favoriteArchiver{favorites: favorites}
-	metadataFetcher := &metadataAdapter{fetcher: &metadata.Fetcher{}}
+	metadataFetcher := &metadataAdapter{fetcher: &metadata.Fetcher{}, titles: &ytdlp.TitleFetcher{}}
 	p := player.New(mpdConn, store.NewMemoryStore(), idx, resolver, archiver, metadataFetcher)
 	hub := ws.NewHub()
 
@@ -145,7 +150,14 @@ func main() {
 	// just an HTTP client with a rate limiter, no credentials/setup
 	// required), unlike the OLED/bucket-mode pieces above which are
 	// genuinely optional accessories.
-	artAPI := &artAdapter{mpd: mpdConn, coverArt: &coverart.Fetcher{}, library: p, store: artStore, jobs: jobsMgr}
+	artAPI := &artAdapter{
+		mpd:        mpdConn,
+		coverArt:   &coverart.Fetcher{},
+		thumbnails: &ytdlp.ThumbnailFetcher{},
+		library:    p,
+		store:      artStore,
+		jobs:       jobsMgr,
+	}
 
 	// broadcastStatus fetches the current mpd status and pushes it to every
 	// connected WebSocket client. It's the shared endpoint for both the
@@ -191,6 +203,17 @@ func main() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		prefetchedFor := -1
+		// lastOLEDPush gates just this ticker's own OLED push, per
+		// config.OLED.ElapsedUpdateIntervalSeconds — the web UI's
+		// WebSocket broadcast below still happens every second
+		// regardless, since its progress bar is meant to move
+		// continuously. A track/play-state/volume change reaches the
+		// OLED immediately either way, via broadcastStatus's own
+		// idle-watcher-triggered call above, which is unconditional and
+		// entirely independent of this ticker — so throttling this
+		// specific call only ever affects how often "elapsed time ticked
+		// up, nothing else changed" gets pushed, never a real change.
+		var lastOLEDPush time.Time
 		for range ticker.C {
 			status, err := p.Status()
 			if err != nil {
@@ -205,7 +228,15 @@ func main() {
 				continue
 			}
 			hub.Broadcast(data)
-			updateOLEDTrack(oled, status)
+
+			interval := cfgStore.Get().OLED.ElapsedUpdateIntervalSeconds
+			if interval <= 0 {
+				interval = config.DefaultElapsedUpdateIntervalSeconds
+			}
+			if time.Since(lastOLEDPush) >= time.Duration(interval)*time.Second {
+				updateOLEDTrack(oled, status)
+				lastOLEDPush = time.Now()
+			}
 
 			if status.Duration <= 0 || status.SongID == prefetchedFor {
 				continue

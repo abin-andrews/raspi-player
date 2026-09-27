@@ -61,8 +61,14 @@ pushed to the frontend over the same WebSocket as a third envelope type, `"jobs"
 `"status"`/`"downloads"`. The Library tab's Tracks view uses real Previous/Next pagination rather than an
 accumulating "Load more" list, and editing an existing entry opens in a `Modal` (add still uses an inline
 `Collapse`) so the edit form is visible regardless of how far down a paginated list the row being edited
-was. See Architecture notes for how the bucket-mode pieces fit together. Update this file as the project
-grows; don't let it drift from reality.
+was — the edit form also has a "Look up title/artist/album" action (`internal/coverart.Fetcher.
+SearchMetadata`, the same MusicBrainz client the album art fallback uses) offering candidate metadata
+matches as clickable suggestions, never applied automatically. `internal/ytdlp` is a new addition: a
+submitted YouTube URL (`youtube.com`/`youtu.be`) is detected and its audio-only stream extracted via the
+`yt-dlp` CLI, then handled exactly like any other bucket-mode download — cached, evicted, prefetched, and
+URL-reversed the same way — regardless of whether "stream"/"bucket" mode is configured, since mpd can't
+stream a video-hosting page directly under either one. See Architecture notes for how the bucket-mode
+pieces fit together. Update this file as the project grows; don't let it drift from reality.
 
 ## Purpose
 
@@ -145,13 +151,25 @@ internal/urlcheck/      Checker.Check(url) verifies a URL responds successfully 
                         after headers) before player.PlayURL/AddToQueue ever hand it to mpd. See Architecture
                         notes for why.
 internal/bucket/        On-disk LRU cache of downloaded audio files, keyed by source URL (Open/Lookup/
-                        Contains/Download/Stats/List/Remove). A persisted filename->URL index
+                        Contains/Download/DownloadVia/Stats/List/Remove). A persisted filename->URL index
                         (.index.json) lives alongside the cached files themselves, since the filename is a
                         one-way content hash — without it List couldn't report which URL each entry is.
                         Two independent instances back two different concepts — the evictable
                         "download-then-stream" playback cache, and a separate, non-evictable permanent
-                        favorites archive — both respecting a shared disk-space safety margin. See
-                        Architecture notes.
+                        favorites archive — both respecting a shared disk-space safety margin. DownloadVia
+                        is Download's general form for a source that isn't a plain HTTP GET (e.g.
+                        internal/ytdlp extracting YouTube audio via a subprocess) — see Architecture notes
+                        for both.
+internal/ytdlp/         Detects YouTube video URLs (IsYouTubeURL) across every commonly used URL shape
+                        (VideoID: watch links, youtu.be share links, embed/Shorts/live links, with
+                        arbitrary extra query params) and extracts their audio-only stream to a local file
+                        via the yt-dlp CLI (Extractor.ExtractAudio) — shells out to an already-installed
+                        yt-dlp binary, never vendors or reimplements any of its extraction logic itself.
+                        Also fetches a video's thumbnail (ThumbnailFetcher, a plain HTTP GET against
+                        YouTube's predictable image URLs — no yt-dlp/API call needed) and title
+                        (TitleFetcher, via YouTube's oEmbed endpoint) independently of audio extraction —
+                        see Architecture notes for how all of this plugs into the bucket cache/mode-aware
+                        resolver, the album art system, and metadata enrichment respectively.
 internal/artstore/      Disk-backed store for resolved album art, content-addressed by source URL —
                         Open/Lookup/Put, a persisted {filename, hasArt} index (.index.json, same pattern as
                         internal/bucket's), same reasoning as internal/bucket for why the index lives on
@@ -296,8 +314,10 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   lookup — never fetches), `POST /api/albumart/refresh {url,artist,album}` (bypasses the cache and always
   re-resolves, e.g. after a re-tag or to retry the MusicBrainz fallback — see the album art architecture
   note below), `POST /api/albumart/warm` (kicks off a background full-library resolve as a tracked
-  `internal/jobs` job, 202), `GET /api/jobs` (every tracked job, same shape pushed over the `"jobs"` WS
-  envelope — see the generic job system note below), and the mpd-queue routes:
+  `internal/jobs` job, 202), `POST /api/albumart/suggest {query}` (candidate Title/Artist/Album matches for
+  the Library edit form's "Look up" action, via the same MusicBrainz client the art fallback already uses —
+  see the metadata-suggestion note below), `GET /api/jobs` (every tracked job, same shape pushed over the
+  `"jobs"` WS envelope — see the generic job system note below), and the mpd-queue routes:
   `GET /api/queue`, `POST /api/queue {url}` (adds without playing — distinct from `POST /api/play`),
   `DELETE /api/queue/{id}`, `POST /api/queue/{id}/move {position}`, `POST /api/queue/{id}/play`,
   `DELETE /api/queue` (clear all). There's no backend "mute" — the frontend
@@ -409,6 +429,114 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   throwaway mpd instance (separate port, own config, `null` audio output) — **never the system's real mpd** —
   after two earlier incidents this session where ad hoc `mpc`/API testing against the live instance corrupted
   real queue state. Always use an isolated instance for anything beyond a read-only check.
+  **`DownloadVia` — the same cache for a source that isn't a plain HTTP GET**: `Download`'s whole shape (make
+  room within the size cap/safety margin, atomically rename into place, update the URL index) is generic over
+  *how* the bytes were obtained — only the HTTP GET part is specific to `Download` itself. `DownloadVia(ctx,
+  url, fetch)` factors that out: `fetch` is handed a directory (the store's own `dir`, so the final rename
+  stays on one filesystem) and must create a file there however it needs to, returning that file's path —
+  used by `internal/ytdlp`'s YouTube extraction (see the YouTube-URL note below), and generically available
+  for any future "mpd can't fetch this and it's not a plain HTTP GET" source. The one real wrinkle:
+  `Download`'s `keyFor(url)` guesses the cached file's extension *from the URL itself* (fine for an ordinary
+  HTTP URL, whose path usually does end in something like `.mp3`), but a source like a YouTube watch link
+  carries no such information at all — so `DownloadVia` instead preserves whichever extension `fetch`'s own
+  output file actually has (`filepath.Ext(fetchedPath)`), and `Contains`/`Lookup`/`Remove` were all changed to
+  find a cached entry by glob-matching its content hash prefix (`hashFor(url)+".*"`) rather than assuming
+  `keyFor`'s URL-guessed extension is necessarily the real one — needed for any of them to ever find a
+  `DownloadVia`-stored entry at all, since its extension isn't derived from the URL the same way. **Found and
+  fixed in the same pass, unrelated to `DownloadVia` itself**: `keyFor` used to compute its content hash on
+  its own already-truncated local copy of `url` (truncated at `?`/`#`, done to guess the extension) rather
+  than the original full URL — meaning a URL with a query string hashed differently depending on whether
+  the code path truncated first, a latent bug that happened to never matter before because every caller went
+  through the same single `keyFor` call, but would have caused exactly the same "just extracted, but not
+  found" mismatch the moment `hashFor` (used directly by `DownloadVia`/`find`, on the *untruncated* URL) was
+  introduced alongside it. `TestKeyForIsStableAndFilesystemSafe` (a pre-existing test, using a URL with `?`/
+  `#`/`/` in its query string) caught this immediately once `find` started disagreeing with `keyFor`.
+- **YouTube URL support via yt-dlp** (`internal/ytdlp`, `modeResolver.resolveYouTube` in `cmd/pi-streamer/
+  bucket.go`): mpd has no idea what to do with a `youtube.com`/`youtu.be` URL under *any* playback mode —
+  there's no media file to stream directly at that URL, only a video-hosting page — so `modeResolver.Resolve`
+  checks `ytdlp.IsYouTubeURL(url)` *before* the stream-vs-bucket mode branch and, if it matches, always routes
+  through `resolveYouTube` regardless of the configured mode: a YouTube link download-then-streams even in
+  `"stream"` mode, since "stream directly" simply isn't an option for it. `IsYouTubeURL` matches by hostname
+  (`youtube.com` with an optional `www`/`m`/`music` subdomain, or `youtu.be`) rather than searching the whole
+  URL string, so something that merely contains "youtube" somewhere isn't mistaken for a real video link.
+  `resolveYouTube` reuses the *ordinary bucket playback cache* (the same `*bucket.Store` stream/bucket mode
+  already share) via `Lookup`/`DownloadVia` — a YouTube URL extracted once stays cached exactly like any
+  bucket-mode download, including LRU eviction, the safety margin, and (since `Unresolve`/`prefetchNext`
+  already operate on `bucket.Store` generically, not on *how* an entry got there) working correctly with
+  prefetching and the Queue/Status URL-reversal path with no extra code at all. `ytdlp.Extractor.ExtractAudio`
+  shells out to the `yt-dlp` CLI (`-f bestaudio --no-playlist --embed-metadata -o <dir>/ytdlp-<ts>.%(ext)s
+  <url>`) — never vendors or reimplements any of yt-dlp's own extraction logic — and glob-matches
+  `ytdlp-<ts>.*` afterward to find whatever container yt-dlp actually picked (varies by video: opus/webm,
+  m4a, etc.), since the daemon has no need to pin down one specific format when mpd/ffmpeg can decode any of
+  them directly. `--embed-metadata` has yt-dlp tag the downloaded file with the video's own title via ffmpeg
+  as part of downloading it — deliberately not a separate "fetch the title" round trip — so mpd's ordinary
+  tag-reading picks up a real title through the exact same path every other track's `Title` already comes
+  through, with zero extra plumbing on this daemon's side; if embedding fails for any reason (e.g. ffmpeg
+  missing), yt-dlp itself only warns rather than failing the download, so the track still plays, just falling
+  back to the usual URL-derived title like any other untitled track. `yt-dlp`/`ffmpeg` are expected to
+  already be installed and on `PATH` (`make install-deps`/`install-deps-pi` do this via `apt-get install
+  yt-dlp ffmpeg`; `-ytdlp-path` overrides the binary location if it's installed somewhere else) — a missing
+  binary simply fails that one play/queue request (`exec.Command` reports "executable file not found"), not
+  a reason to refuse starting the daemon at all, the same graceful-degradation stance as a missing OLED or
+  unconfigured indexer elsewhere in this codebase. Tested via a fake shell script standing in for the real
+  `yt-dlp` binary (`internal/ytdlp/ytdlp_test.go`, `cmd/pi-streamer/bucket_test.go`) that creates a file
+  matching whatever `-o` template it's given without touching the network at all — never a live call to the
+  real YouTube/yt-dlp in this repo's test suite, same reasoning as the MusicBrainz tests elsewhere.
+  **`VideoID` — extracting the video ID across every URL shape a real "share/copy link" button can
+  produce**: `IsYouTubeURL` only checks the *host*, which is enough to decide "route this through yt-dlp
+  extraction," but the thumbnail/title lookups below need the actual 11-character video ID, and a bare host
+  check says nothing about *which* video. `VideoID(rawURL) (string, bool)` handles every commonly-seen
+  shape: an ordinary watch link (`?v=<id>`, on `youtube.com`/`m.youtube.com`/`music.youtube.com`), a
+  share/short link (`youtu.be/<id>`), an embed link (`/embed/<id>`), a Shorts link (`/shorts/<id>`), and a
+  livestream link (`/live/<id>`) — all with arbitrary extra query parameters (a share link's `?si=...`
+  tracking token, a timestamp's `&t=42s`, a playlist's `&list=...`) simply ignored rather than tripping up
+  extraction, since real "copy link" buttons commonly attach exactly these. Deliberately returns `("",
+  false)` rather than guessing for a URL `IsYouTubeURL` still accepts but that doesn't identify a single
+  video at all (a bare channel or playlist-only URL) — there's no video to build a thumbnail URL or fetch a
+  title for in that case.
+  **Album art: the video thumbnail, not mpd or MusicBrainz** (`ThumbnailFetcher`, wired into
+  `artAdapter.resolveYouTubeThumbnail` in `cmd/pi-streamer/albumart.go`) — `artAdapter.resolve`'s general
+  path (try `mpd.AlbumArt`, fall back to MusicBrainz) is actively the *wrong* thing to try for a YouTube URL:
+  mpd never has the *original* `youtube.com` URL under any queue entry at all (it only ever sees the
+  resolved local-proxy URL the extracted audio was served from — see `modeResolver` above), so
+  `AlbumArt(youtubeURL)` would always come back empty, and the MusicBrainz fallback needs artist/album,
+  which a YouTube track typically doesn't have until/unless a user edits it in. `resolve` therefore checks
+  `a.thumbnails != nil && ytdlp.IsYouTubeURL(url)` *before* even attempting the general path, going straight
+  to `ThumbnailFetcher.Fetch` instead. `Fetch` tries `maxresdefault.jpg` (highest resolution) first, falling
+  back to `hqdefault.jpg` (480×360, guaranteed to exist for every real video, unlike maxres) on *any* failure
+  fetching the first one — a 404 or a genuine network error are treated identically, since the only thing
+  that matters is "did we get bytes back." Both sizes 404ing is treated the same as mpd's own confirmed-no-
+  art answer (`(nil, nil)`, cached as such via `artstore.Store.Put` exactly like every other source) rather
+  than an error. `a.thumbnails` is nil-able the same way `a.coverArt` is — with no thumbnail fetcher
+  configured, a YouTube URL simply falls through to the general path (which will just find nothing, same net
+  effect, via one pointless `mpd.AlbumArt` round trip instead of a thumbnail fetch).
+  **Title: YouTube's oEmbed endpoint, independent of extraction/embedding** (`TitleFetcher`, wired into
+  `metadataAdapter.Fetch` in `cmd/pi-streamer/metadata.go`) — `--embed-metadata` (above) already gets a real
+  title onto the *extracted audio file* for mpd's own tag-reading to pick up once the track is actually
+  played, but that's downstream of playback and doesn't populate the *search index* at add-time the way
+  `internal/metadata.Fetcher` does for an ordinary tagged file. `internal/metadata.Fetcher` itself is useless
+  for a YouTube URL regardless (it does a ranged HTTP GET expecting an audio container; a `youtube.com` URL
+  is an HTML page), so `metadataAdapter.Fetch` checks `ytdlp.IsYouTubeURL(url)` first and, if true, asks
+  YouTube's oEmbed endpoint (`https://www.youtube.com/oembed?url=...&format=json`) for the title directly —
+  a single lightweight, unauthenticated GET returning a small JSON document, deliberately *not* a yt-dlp
+  subprocess call, since a title alone doesn't need yt-dlp's much heavier format-resolution/download
+  machinery. This runs through the exact same `player.enrichMetadata` add-time path every other track's
+  metadata enrichment already does (see the URL-dedup/metadata-enrichment note below) — no changes needed in
+  `internal/player` at all, since `MetadataFetcher` was already the abstraction point for "how do we learn
+  more about this URL," and `metadataAdapter` (the real implementation) is where the YouTube-specific
+  routing belongs. `titleFetcher`/`audioTagFetcher` (in `cmd/pi-streamer/metadata.go`) are narrow interfaces
+  over `*ytdlp.TitleFetcher`/`*internal/metadata.Fetcher` respectively, matching the "package defines the
+  interface it needs" pattern used throughout this codebase — specifically so tests can fake both and never
+  make a real network call (an earlier draft of this test skipped that and made a genuine request to a real
+  `youtu.be` URL from the test suite by accident, caught by its suspicious ~1.4s runtime before being fixed).
+  **Frontend: a YouTube badge wherever a track is shown** (`web/src/isYouTubeUrl.js`) — a small JS port of
+  `ytdlp.IsYouTubeURL`'s same host-based check (kept in sync intentionally: if the Go version ever
+  recognizes a new host, this one should too), used to render a compact `IconBrandYoutube` next to a
+  track's title in `LibraryEntryRow.jsx` (list view), as a small overlay badge on the art itself in
+  `LibraryEntryGridCard.jsx` (grid view), in `Queue.jsx`'s rows, and in `NowPlayingScreen.jsx`'s title line
+  — everywhere a track is displayed *except* `PlayerBar.jsx`'s mini bar, deliberately: that view is already
+  the most space-constrained one (art + title + artist + an expand chevron all competing for a ~240px
+  column), and the same track is one tap away from the full-screen view that does show it.
 - **Queue/Status title fallback** (`internal/player/title.go`'s `deriveTitleFromURL`): mpd's own `Title` tag is
   simply empty for a track it hasn't (or can't) read tags for — `Player.Queue`/`Status` were otherwise passing
   that "as mpd reports it" straight through, showing a blank field or the bare URL. `deriveTitleFromURL` builds
@@ -430,33 +558,43 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   title. `internal/mpdclient.FakeClient` never had this bug (its `Song` field is just whatever's set
   directly), which is exactly why the whole unit test suite never caught it — same class of gap as the
   synchronous-indexing and album-art-mutex bugs before it, only ever found via live testing.
-- **Now-playing metadata is enriched from the search index, not just mpd's own file tags**
-  (`Player.enrichStatus`/`refreshStatusEnrichment`/`invalidateStatusEnrichment` in `internal/player/
-  player.go`): reported bug — editing a track's Title/Artist/Album via the Library tab (`AddToLibrary`,
-  which only ever updates the search index, never the file itself) saved successfully, but the OLED (and,
-  it turned out, `PlayerBar`/`NowPlayingScreen`/`GET /api/status` generally) kept showing the *original*
-  embedded file tags, since `Player.Status()` previously passed mpd's `CurrentSong` Title/Artist/Album
-  straight through with no cross-reference to the index at all. Fixed by having `Status()` override
-  Title/Artist/Album with the index's values for the current `status.Song`, whenever the index has a
-  non-empty value for that field (an empty index field leaves mpd's own tag alone, rather than blanking it
-  out — see `TestStatusEnrichmentDoesNotBlankFieldsTheIndexLeavesEmpty`). **Does not call `Indexer.Get` on
-  every `Status()` call**, even though `Status()` is polled once a second while playing
-  (`cmd/pi-streamer`'s ticker) — that would gate the status ticker's throughput on the search-indexer
-  service's own latency/availability on every single tick, reintroducing exactly the class of bug already
-  fixed once for the play-time indexing path (see the URL-dedup/metadata-enrichment note below). Instead:
-  a lookup only ever fires when `status.Song` changes (`p.statusURL != status.Song`), and even then runs in
-  its own goroutine so it can never block `Status()` itself — the call that detects the song change returns
-  mpd's own (unenriched) tags immediately, and a later call picks up the enriched values once the goroutine
-  resolves (typically well under the 1s tick interval). **Editing the *currently playing* track's metadata
-  needed its own separate fix**: since the song URL doesn't change when you edit its metadata, the
-  cache-miss trigger above would never fire, and the edit would silently not show up until the next track
-  started — exactly the reported bug's root cause once traced far enough. `AddToLibrary` now calls
-  `invalidateStatusEnrichment(url)` after a successful `IndexURL`, which — only if `url` matches the
-  currently cached/playing song — kicks a fresh background lookup immediately, rather than waiting for a
-  song change that may never come. Verified live end-to-end against the isolated mpd instance: played an
-  `ffmpeg`-tagged file, confirmed `GET /api/status` showed its embedded tags, edited its Artist/Album via
-  `POST /api/library` while it was still playing, and confirmed `GET /api/status` reflected the edit
-  immediately, with no track change needed.
+- **Now-playing *and queued* metadata is enriched from the search index, not just mpd's own file tags**
+  (`Player.lookupEnrichment`/`refreshEnrichment`/`invalidateEnrichment` in `internal/player/player.go`,
+  used by both `enrichStatus` and `Queue`): reported bug — editing a track's Title/Artist/Album via the
+  Library tab (`AddToLibrary`, which only ever updates the search index, never the file itself) saved
+  successfully, but the OLED (and, it turned out, `PlayerBar`/`NowPlayingScreen`/`GET /api/status`
+  generally) kept showing the *original* embedded file tags, since `Player.Status()` previously passed
+  mpd's `CurrentSong` Title/Artist/Album straight through with no cross-reference to the index at all.
+  Fixed by having `Status()` override Title/Artist/Album with the index's values for the current
+  `status.Song`, whenever the index has a non-empty value for that field (an empty index field leaves
+  mpd's own tag alone, rather than blanking it out — see
+  `TestStatusEnrichmentDoesNotBlankFieldsTheIndexLeavesEmpty`).
+  **Generalized to `Queue` too, on a follow-up request** ("queue should have the same logic as track for
+  the title") — `Queue()` previously had *no* index cross-reference at all, only mpd's own tag or
+  `deriveTitleFromURL`'s fallback, which produces useless results for some sources (a bare YouTube watch
+  link's path is just `/watch`). The single-slot cache (`statusURL`/`statusResult`/`statusResolved`) that
+  originally backed only `enrichStatus` doesn't generalize to `Queue`, which can have many
+  simultaneously-displayed tracks — replaced with `enrichCache map[string]enrichedResult`, keyed by URL,
+  shared by both `Status` and `Queue`; `lookupEnrichment(url)` is the one shared entry point either calls.
+  **Deliberately never pruned**: an earlier per-song single slot self-evicted just by being overwritten on
+  every song change, but a personal-scale set of distinct URLs accumulated over one daemon run (each cache
+  entry a few small strings) isn't worth adding LRU eviction for.
+  **Does not call `Indexer.Get` on every `Status()`/`Queue()` call**, even though `Status()` is polled once
+  a second while playing (`cmd/pi-streamer`'s ticker) — that would gate the status ticker's throughput on
+  the search-indexer service's own latency/availability on every single tick, reintroducing exactly the
+  class of bug already fixed once for the play-time indexing path (see the URL-dedup/metadata-enrichment
+  note below). Instead: a lookup only ever fires the *first* time a given URL is asked about at all
+  (`lookupEnrichment`'s cache-miss branch), and even then runs in its own goroutine so it can never block
+  the caller — the call that first sees a new URL returns mpd's own (unenriched) tags/URL-derived fallback
+  immediately, and a later call picks up the enriched values once the goroutine resolves (typically well
+  under either caller's poll interval). **Editing a track's metadata needed its own separate fix**: since
+  `lookupEnrichment`'s cache only ever gets populated once per URL and has no other trigger to refresh
+  itself, an edit would otherwise never show up at all once cached — `AddToLibrary` calls
+  `invalidateEnrichment(url)` after a successful `IndexURL`, which — only if `url` is already cached at
+  all — kicks a fresh background lookup immediately. Verified live end-to-end against the isolated mpd
+  instance: played an `ffmpeg`-tagged file, confirmed `GET /api/status` showed its embedded tags, edited
+  its Artist/Album via `POST /api/library` while it was still playing, and confirmed `GET /api/status`
+  reflected the edit immediately, with no track change needed.
 - **Media library** (`internal/search.Index.List`, `GET /api/library`, the Library tab): "remembers every URL
   added, referred at any point in future" turned out to need **no new persistence** — `internal/search`'s
   SQLite index already durably indexes every played/favorited/playlisted URL (`player.index`'s best-effort
@@ -779,6 +917,49 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   (`{...queriedArtStatus, ...artOverrides}`) — the batched query only re-runs when the *set* of URLs on
   screen changes, not when one already-known answer is deliberately overwritten, so without this override
   the UI would keep showing the stale pre-refresh answer until some unrelated re-query happened to run.
+- **Custom art as an explicit fallback tier, at track/album/artist scope** (`artstore.Store.PutCustom`/
+  `IsCustom`/`Remove`, `artAdapter.SetCustomArt`/`ClearCustomArt`/`lookupCustomFallback`,
+  `POST`/`DELETE /api/albumart/custom`) — for when auto-resolution (mpd, YouTube thumbnail, MusicBrainz)
+  doesn't find the right art, or anything at all: the user supplies any URL that serves an image (fetched
+  generically, no host restriction — it doesn't have to be YouTube/MusicBrainz/anything else this codebase
+  otherwise knows how to pull art from) and it's recorded under one of three scopes:
+  - **`"track"`** (key: the track's own URL) — always wins, checked *before* the force/cache gate in
+    `resolve` so it's never silently replaced, not even by `Refresh`. `ClearCustomArt` is the only way back
+    to auto-resolution for that track.
+  - **`"album"`**/**`"artist"`** (key: the album/artist name, hashed under a synthetic
+    `customArtKeyForAlbum`/`customArtKeyForArtist` key — never a real URL, so it can't collide with any
+    track's own entry in the same content-addressed store) — only ever consulted as a *fallback*, when a
+    track's own auto-resolution comes up with nothing; album is checked before artist (the more specific of
+    the two). This is the actual "fallback system in case" auto-resolution fails, applied uniformly to every
+    track sharing that album/artist rather than needing to be set per-track.
+  `internal/artstore`'s `entry.Custom` field (persisted in the index alongside `Filename`/`HasArt`) is what
+  makes this distinguishable from an auto-resolved entry at all — `IsCustom` is the only new accessor
+  needed; `Put`/`Lookup`/`Query` themselves stay unaware that "custom" is even a concept. **Frontend**:
+  `CustomArtControl.jsx` (a URL input + set/clear `ActionIcon`s) is shared verbatim across the
+  track/album/artist detail pages in `Library.jsx` rather than duplicated three times, since the
+  interaction is identical for all three scopes — only the `scope`/`artKey`/`label` props differ.
+- **Metadata suggestions in the Library edit form, "baked into" the album art fetch system rather than a
+  separate lookup client** (`internal/coverart.Fetcher.SearchMetadata`, `artAdapter.Suggest`,
+  `POST /api/albumart/suggest`) — the same `*coverart.Fetcher` `artAdapter` already held for the art
+  fallback gained a second method hitting MusicBrainz's *recording* search endpoint (`/recording/?query=`,
+  distinct from `Fetch`'s *release* search) rather than wiring up a separate MusicBrainz client for this;
+  `coverArtFetcher`'s interface (`cmd/pi-streamer/albumart.go`) grew `SearchMetadata` alongside `Fetch`
+  accordingly. Each MusicBrainz "recording" result maps to one `coverart.MetadataSuggestion{Title, Artist,
+  Album}` (`Title` direct, `Artist` from the first artist-credit, `Album` from the first release's title —
+  a recording can appear on several releases; only the first is offered rather than fanning out one
+  suggestion per release). `internal/api.Art` grew `Suggest(query) ([]MetadataSuggestion, error)` (its own
+  mirrored type, same decoupling as `ArtStatus`/`Job`); `artAdapter.Suggest` returns `(nil, nil)` if no
+  `coverArt` fetcher is configured at all, the same graceful-skip the art fallback itself already has.
+  **Frontend**: `LibraryEntryForm.jsx`'s "Look up title/artist/album" button (shown for every edit, not
+  just add — there is no add path left, see the unified Library UI note above) queries with whatever's
+  already typed into Title/Artist/Album (joined into one string), falling back to a name derived from the
+  URL's last path segment (`deriveQueryFromURL`, a JS cousin of the backend's own `deriveTitleFromURL`) when
+  all three are still blank. Results render as clickable cards below the button; clicking one fills the
+  three fields (only overwriting a field the suggestion actually has a value for) without saving —
+  **suggestions are never applied automatically**, since MusicBrainz's free-text search returns its best
+  guesses, not confirmed corrections, and the user still reviews/edits/Saves as normal afterward. Tested
+  against `httptest` fake servers (`internal/coverart/coverart_test.go`, `cmd/pi-streamer/albumart_test.go`)
+  — never a live call to the real MusicBrainz service, same as the existing art-fallback tests.
 - **Generic background job tracking** (`internal/jobs`, new): `Warm` above is deliberately not a bare `go
   func(){}` reporting nothing — the previous design had no way to show progress or even confirm a warm scan
   was still running versus silently having died. `jobs.Manager.Start(name, func(h *jobs.Handle) error)`
@@ -829,18 +1010,44 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   `cmd/pi-streamer/oled.go`. `go.bug.st/serial` is pure Go (no CGO), verified to cross-compile clean for both
   `GOOS=linux GOARCH=arm` and `GOARCH=arm64`, same rationale as `modernc.org/sqlite` above.
 - **`internal/config`**: a small on-disk JSON settings store (`config.Store`), reintroducing persistent state
-  after the Drive removal above — currently holds just `OLED.Port`/`OLED.Baud`, but `Config` is structured so
-  more settings can be added later without a new mechanism. `Store.Get`/`Set`/`Reload` are the whole API;
-  `Set` persists to disk, `Reload` re-reads the file (picking up a hand-edit made directly on the Pi, e.g. over
-  SSH) — neither is wired to *do* anything by itself. `cmd/pi-streamer/oled.go`'s `configAdapter` is what
-  bridges `Store` to `internal/api.Config` and gives `Set`/`Reload` their live effect, by calling
-  `oledManager.reconfigure` with the new port/baud on every change (an empty port disconnects). This is the
-  **web UI's actual mechanism for configuring the OLED display**: `web/src/components/Settings.jsx` (the
-  Settings tab) calls `GET/PUT /api/config` and `POST /api/config/reload`, plus `GET /api/oled/status` and
-  `GET /api/oled/ports` (serial port auto-detection via `internal/serial.ListPorts`, wrapping
-  `go.bug.st/serial.GetPortsList`) so the user picks a port from a dropdown rather than typing a device path.
-  There are deliberately no separate connect/disconnect endpoints — connecting *is* the side effect of setting
-  `oled.port` in config. Default path: `-config-path` (default `config.json`, written `0600`, gitignored).
+  after the Drive removal above — `OLED` (`Port`/`Baud`/`ElapsedUpdateIntervalSeconds`), `Bucket`, and `UI`
+  (currently just `HideVolumeControl`), with `Config` structured so more settings can be added later without
+  a new mechanism. `Store.Get`/`Set`/`Reload` are the whole API; `Set` persists to disk, `Reload` re-reads
+  the file (picking up a hand-edit made directly on the Pi, e.g. over SSH) — neither is wired to *do*
+  anything by itself. `cmd/pi-streamer/oled.go`'s `configAdapter` is what bridges `Store` to
+  `internal/api.Config` and gives `Set`/`Reload` their live effect, by calling `oledManager.reconfigure` with
+  the new port/baud on every change (an empty port disconnects) — `UI`'s fields have no such daemon-side
+  effect at all; the frontend just reads them back via the same `GET /api/config` and applies them itself
+  (see below). This is the **web UI's actual mechanism for configuring the OLED display**:
+  `web/src/components/Settings.jsx` calls `GET/PUT /api/config` and `POST /api/config/reload`, plus
+  `GET /api/oled/status` and `GET /api/oled/ports` (serial port auto-detection via `internal/serial.
+  ListPorts`, wrapping `go.bug.st/serial.GetPortsList`) so the user picks a port from a dropdown rather than
+  typing a device path. There are deliberately no separate connect/disconnect endpoints — connecting *is*
+  the side effect of setting `oled.port` in config. Default path: `-config-path` (default `config.json`,
+  written `0600`, gitignored).
+  **`Settings.jsx` is now a sidebar, not one long scrolling page** — General (Library view mode, Album Art
+  warming, the volume-control toggle below), OLED Display, and Cache (Audio Bucket config/usage plus
+  `Bucket.jsx`'s storage browsing) are each their own section, picked via a `NavLink` list (`section` state,
+  persisted the same way Library's own view state is) rather than Library's horizontally-scrolling `Chip`
+  row — Settings is reached through a full-screen `Modal` with real width to spare, not Library's
+  mobile-first bottom-nav context. Save/Reload stay in a shared header above the sidebar+content split
+  (not duplicated per section), since one `PUT /api/config` call always covers every field regardless of
+  which section is currently showing.
+  **`OLED.ElapsedUpdateIntervalSeconds`** throttles only `cmd/pi-streamer/main.go`'s 1s status-ticker's own
+  push to the display — the *idle-watcher*-triggered `broadcastStatus()` (a track/play/pause/volume change
+  reported by mpd itself) is a separate, unconditional call, entirely unaffected by this setting, so a real
+  change always reaches the display immediately regardless of how this is configured; only "just the
+  elapsed seconds ticking, nothing else changed" respects the interval. Zero (unconfigured) means
+  `config.DefaultElapsedUpdateIntervalSeconds` (1, the original hardcoded behavior).
+  **`UI.HideVolumeControl`** hides the volume slider in `PlayerBar.jsx`/`NowPlayingScreen.jsx` — a
+  web-UI-only preference (not touching the OLED at all, despite being asked for in the same breath as the
+  interval setting above): the OLED's own 256×64 layout is already fully packed edge-to-edge (title/artist/
+  album/progress bar/elapsed-time all using every available pixel row), so a volume indicator there would
+  need careful repositioning that can't be visually verified without the real device — asked about directly
+  and deliberately scoped to the web UI instead. `App.jsx` fetches `GET /api/config` once on mount and again
+  whenever the Settings `Modal` closes (not pushed over `/ws` like status/downloads/jobs — this changes rarely
+  enough that fetch-on-close is simpler than a fourth envelope type for it), passing `ui.hideVolumeControl`
+  down to both components as a prop.
 - The Pi Zero 2W is resource-constrained: favor a lightweight daemon and frontend build. `cmd/pi-streamer`
   serves `web/dist` as static files at `/` (via the `-web-dir` flag, default `"web/dist"`) alongside `/api`
   and `/ws`, so `make web-build && make run` serves the whole app from one process. Not yet done: embedding
@@ -902,7 +1109,10 @@ if the deployed OS image turns out to be 64-bit — override with `GOARM=7` or u
 `cmd/pi-streamer` flags beyond the earlier ones: `-config-path` (default `config.json`), `-bucket-dir`
 (default `bucket-cache`), `-favorites-dir` (default `favorites`), `-bucket-stream-addr` (default
 `127.0.0.1:8082` — the loopback-only file server mpd fetches cached bucket files from, see the bucket cache
-architecture note) — these are just *where on disk*/*what address* things live; none of the OLED port/baud or
+architecture note), `-ytdlp-path` (default `""`, resolving `yt-dlp` via `PATH` — the yt-dlp executable used
+to extract audio from YouTube URLs, see the YouTube-URL architecture note; a submitted YouTube URL just
+fails to play, per-request, if yt-dlp isn't installed at all, rather than the daemon refusing to start over
+it) — these are just *where on disk*/*what address*/*what binary* things live; none of the OLED port/baud or
 bucket mode/size/margin settings are flags at all, since they're
 configured live through the web UI's Settings tab (or by hand-editing `config.json` and calling
 `POST /api/config/reload`), not at startup, so no daemon restart is needed to plug in a display or switch

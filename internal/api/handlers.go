@@ -358,6 +358,83 @@ func handleWarmAlbumArt(art Art) http.HandlerFunc {
 	}
 }
 
+// handleSuggestMetadata looks up candidate Title/Artist/Album matches for
+// the submitted query (typically whatever's already in an edit form, or a
+// name derived from the track's URL) — for the Library edit form's "Look
+// up" action to show as suggestions, not applied automatically.
+func handleSuggestMetadata(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Query == "" {
+			writeError(w, http.StatusBadRequest, errors.New("query is required"))
+			return
+		}
+		suggestions, err := art.Suggest(req.Query)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string][]MetadataSuggestion{"suggestions": suggestions})
+	}
+}
+
+// handleSetCustomArt fetches the submitted imageUrl and records it as
+// scope/key's custom art — see Art.SetCustomArt's doc comment for what
+// scope/key mean and how this interacts with auto-resolution afterward.
+func handleSetCustomArt(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Scope    string `json:"scope"`
+			Key      string `json:"key"`
+			ImageURL string `json:"imageUrl"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Scope == "" || req.Key == "" || req.ImageURL == "" {
+			writeError(w, http.StatusBadRequest, errors.New("scope, key, and imageUrl are all required"))
+			return
+		}
+		status, err := art.SetCustomArt(req.Scope, req.Key, req.ImageURL)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+	}
+}
+
+// handleClearCustomArt removes scope/key's custom art, reverting it to
+// whatever auto-resolution finds on its own next Resolve/Refresh.
+func handleClearCustomArt(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Scope string `json:"scope"`
+			Key   string `json:"key"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Scope == "" || req.Key == "" {
+			writeError(w, http.StatusBadRequest, errors.New("scope and key are both required"))
+			return
+		}
+		if err := art.ClearCustomArt(req.Scope, req.Key); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 // handleListJobs reports every currently-tracked background job (running
 // or recently finished) — the frontend normally gets this pushed over
 // /ws instead (see main.go's wsMessage, mirroring how bucket-download
@@ -571,6 +648,9 @@ func handleSetConfig(cfg Config, o Oled) http.HandlerFunc {
 // empty port always passes (that's "disabled"), but a non-empty one must
 // name a port o currently sees attached, at one of the allowed baud rates.
 func validateOLED(oled config.OLED, o Oled) error {
+	if oled.ElapsedUpdateIntervalSeconds < 0 {
+		return errors.New("elapsed update interval must not be negative")
+	}
 	if oled.Port == "" {
 		return nil
 	}

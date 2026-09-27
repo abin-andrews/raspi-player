@@ -1,5 +1,6 @@
 import { ActionIcon, Anchor, Badge, Card, Group, Menu, Stack, Text } from '@mantine/core'
 import {
+  IconBrandYoutube,
   IconDisc,
   IconDotsVertical,
   IconHeart,
@@ -12,6 +13,7 @@ import {
   IconTrash,
   IconUser,
 } from '@tabler/icons-react'
+import { isYouTubeUrl } from '../isYouTubeUrl.js'
 import TrackArt from './TrackArt.jsx'
 
 const ART_SIZE = 120
@@ -46,6 +48,22 @@ function LibraryEntryGridCard({
             resolvedPath={artStatus?.path}
             size={ART_SIZE}
           />
+          {isYouTubeUrl(entry.url) && (
+            <span
+              title="From YouTube"
+              style={{
+                position: 'absolute',
+                top: 4,
+                left: 4,
+                display: 'inline-flex',
+                background: 'rgba(0, 0, 0, 0.55)',
+                borderRadius: 'var(--mantine-radius-sm)',
+                padding: 2,
+              }}
+            >
+              <IconBrandYoutube size={14} color="var(--mantine-color-red-5)" />
+            </span>
+          )}
           <Menu position="bottom-end" withinPortal>
             <Menu.Target>
               <ActionIcon

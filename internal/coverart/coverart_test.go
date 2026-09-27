@@ -123,6 +123,76 @@ func TestFetchPropagatesArchiveError(t *testing.T) {
 	}
 }
 
+func TestSearchMetadataRequiresQuery(t *testing.T) {
+	f := &Fetcher{}
+	if _, err := f.SearchMetadata(context.Background(), "  ", 5); err == nil {
+		t.Error("SearchMetadata(\"  \"): want error for a blank query, got nil")
+	}
+}
+
+func TestSearchMetadataReturnsCandidates(t *testing.T) {
+	var gotQuery string
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"recordings":[
+			{"title":"Song One","artist-credit":[{"name":"Artist One"}],"releases":[{"id":"mbid-1","title":"Album One"}]},
+			{"title":"Song Two","artist-credit":[{"name":"Artist Two"}],"releases":[]}
+		]}`))
+	}))
+	defer search.Close()
+
+	f := &Fetcher{baseURL: search.URL, minInterval: time.Millisecond}
+	got, err := f.SearchMetadata(context.Background(), "song one", 5)
+	if err != nil {
+		t.Fatalf("SearchMetadata() error = %v, want nil", err)
+	}
+	if gotQuery != "song one" {
+		t.Errorf("search query = %q, want %q", gotQuery, "song one")
+	}
+	want := []MetadataSuggestion{
+		{Title: "Song One", Artist: "Artist One", Album: "Album One"},
+		{Title: "Song Two", Artist: "Artist Two", Album: ""},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("SearchMetadata() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("suggestion[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSearchMetadataReturnsEmptyWhenNothingMatches(t *testing.T) {
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"recordings":[]}`))
+	}))
+	defer search.Close()
+
+	f := &Fetcher{baseURL: search.URL, minInterval: time.Millisecond}
+	got, err := f.SearchMetadata(context.Background(), "nothing matches this", 5)
+	if err != nil {
+		t.Fatalf("SearchMetadata() error = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("SearchMetadata() = %+v, want empty", got)
+	}
+}
+
+func TestSearchMetadataPropagatesSearchError(t *testing.T) {
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer search.Close()
+
+	f := &Fetcher{baseURL: search.URL, minInterval: time.Millisecond}
+	if _, err := f.SearchMetadata(context.Background(), "anything", 5); err == nil {
+		t.Error("SearchMetadata(): want error on a search failure, got nil")
+	}
+}
+
 func TestFetchEnforcesRateLimitBetweenSearchRequests(t *testing.T) {
 	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

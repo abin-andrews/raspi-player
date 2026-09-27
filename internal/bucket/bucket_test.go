@@ -2,6 +2,7 @@ package bucket
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -126,6 +127,90 @@ func TestDownloadFailsOnErrorStatus(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
 		t.Errorf("bucket dir after failed download = %v, want empty (no leftover temp file)", entries)
+	}
+}
+
+func TestDownloadViaFinalizesFetchedFileUnderContentAddressedName(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, 0, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	path, err := s.DownloadVia(context.Background(), "https://youtube.com/watch?v=abc123", func(fetchDir string) (string, error) {
+		p := filepath.Join(fetchDir, "whatever-name.m4a")
+		if err := os.WriteFile(p, []byte("fake-extracted-audio"), 0644); err != nil {
+			return "", err
+		}
+		return p, nil
+	})
+	if err != nil {
+		t.Fatalf("DownloadVia: %v", err)
+	}
+	if filepath.Ext(path) != ".m4a" {
+		t.Errorf("finalized path = %q, want the .m4a extension the fetch callback actually produced", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read finalized file: %v", err)
+	}
+	if string(data) != "fake-extracted-audio" {
+		t.Errorf("finalized content = %q, want %q", data, "fake-extracted-audio")
+	}
+
+	gotPath, ok := s.Lookup("https://youtube.com/watch?v=abc123")
+	if !ok {
+		t.Fatal("Lookup: not found after DownloadVia")
+	}
+	if gotPath != path {
+		t.Errorf("Lookup path = %q, want %q", gotPath, path)
+	}
+}
+
+func TestDownloadViaPropagatesFetchError(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, 0, true)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	wantErr := errors.New("yt-dlp exited with an error")
+	_, err = s.DownloadVia(context.Background(), "https://youtube.com/watch?v=abc123", func(fetchDir string) (string, error) {
+		return "", wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Errorf("DownloadVia error = %v, want %v", err, wantErr)
+	}
+
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("bucket dir after failed fetch = %v, want empty", entries)
+	}
+}
+
+func TestDownloadViaRemovesFetchedFileWhenNoRoomAvailable(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, 100, true) // 100-byte cap, evictable but nothing to evict
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	_, err = s.DownloadVia(context.Background(), "https://youtube.com/watch?v=toobig", func(fetchDir string) (string, error) {
+		p := filepath.Join(fetchDir, "big.m4a")
+		if err := os.WriteFile(p, make([]byte, 1000), 0644); err != nil {
+			return "", err
+		}
+		return p, nil
+	})
+	if err == nil {
+		t.Error("DownloadVia: want an error when the fetched file can't fit within the size cap")
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != indexFileName {
+			t.Errorf("leftover file %q after a refused DownloadVia, want the fetched file removed", e.Name())
+		}
 	}
 }
 

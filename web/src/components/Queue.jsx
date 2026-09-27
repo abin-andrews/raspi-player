@@ -12,6 +12,7 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import {
+  IconBrandYoutube,
   IconChevronDown,
   IconChevronUp,
   IconPlayerPlay,
@@ -29,6 +30,7 @@ import {
 } from '../api.js'
 import { formatTime } from '../format.js'
 import { useCachedUrls } from '../hooks/useCachedUrls.js'
+import { isYouTubeUrl } from '../isYouTubeUrl.js'
 
 // How long a freshly-added row stays visually highlighted after Add to
 // Queue succeeds — long enough to catch the eye, short enough not to
@@ -239,6 +241,11 @@ function Queue({ status }) {
                     <Text fw={500} truncate="end">
                       {track.title || track.url}
                     </Text>
+                    {isYouTubeUrl(track.url) && (
+                      <span title="From YouTube" style={{ display: 'inline-flex', flexShrink: 0 }}>
+                        <IconBrandYoutube size={16} color="var(--mantine-color-red-6)" />
+                      </span>
+                    )}
                     {isPlaying && (
                       <Badge size="xs" color="blue" variant="light">
                         Now Playing

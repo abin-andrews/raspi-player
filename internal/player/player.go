@@ -110,14 +110,26 @@ type Player struct {
 	archiver FavoriteArchiver
 	metadata MetadataFetcher
 
-	// statusEnrichment caches the search index's answer for the currently
-	// playing URL, so Status (polled once a second while playing, per
-	// cmd/pi-streamer's ticker) doesn't make a fresh indexer.Get call on
-	// every single tick — see enrichStatus's doc comment.
-	statusMu       sync.Mutex
-	statusURL      string
-	statusResult   indexer.Result
-	statusResolved bool
+	// enrichCache caches the search index's answer for every URL Status/
+	// Queue have asked about, so neither one makes a fresh indexer.Get
+	// call on every single invocation (Status is polled once a second
+	// while playing, per cmd/pi-streamer's ticker) — see
+	// lookupEnrichment's doc comment. Keyed by URL rather than a single
+	// slot (an earlier version only ever cached "the current song," which
+	// worked for Status but gave Queue nothing to use for its many
+	// simultaneously-displayed tracks) — see lookupEnrichment's own doc
+	// comment for the resulting unbounded-growth trade-off.
+	enrichMu    sync.Mutex
+	enrichCache map[string]enrichedResult
+}
+
+// enrichedResult is one lookupEnrichment cache entry: resolved is false
+// while a background refreshEnrichment call for this URL is still in
+// flight (or hasn't been kicked off by anything other than the very call
+// that just added this entry) — result is the zero value until then.
+type enrichedResult struct {
+	result   indexer.Result
+	resolved bool
 }
 
 // New returns a Player driving mpd through mpd and persisting state via st.
@@ -359,7 +371,7 @@ func (p *Player) AddToLibrary(url, title, artist, album, tags string) error {
 	if err := p.indexer.IndexURL(url, title, artist, album, tags); err != nil {
 		return err
 	}
-	p.invalidateStatusEnrichment(url)
+	p.invalidateEnrichment(url)
 	return nil
 }
 
@@ -410,42 +422,14 @@ func (p *Player) Status() (mpdclient.Status, error) {
 }
 
 // enrichStatus overrides status.Title/Artist/Album with the search index's
-// values for status.Song, if the index has a non-empty value for that
-// field — a deliberate user edit (AddToLibrary) should win over whatever's
-// embedded in the file itself, which is all mpd's own Status/CurrentSong
-// can ever report, and which AddToLibrary only ever updates in the index,
-// never in the file.
-//
-// This does NOT call Indexer.Get on every invocation, even though Status
-// itself is polled once a second while playing (cmd/pi-streamer's ticker):
-// that would gate the status ticker's throughput on the search-indexer
-// service's own latency/availability on every single tick — exactly the
-// class of bug already fixed once for the play-time indexing path (see
-// indexAsync's doc comment) reintroduced for the status path instead. A
-// fresh lookup only ever happens when status.Song actually changes (a new
-// track started), and even then happens in its own goroutine so it can
-// never block Status itself — until it resolves, Status keeps returning
-// mpd's own tag data for that track unchanged, then picks up the enriched
-// values on a later call once the goroutine finishes (typically well
-// under the 1s tick interval for a healthy indexer; worst case, degrades
-// no worse than "the file's own tags show for a moment," never a stall).
+// values for status.Song via lookupEnrichment, if the index has a
+// non-empty value for that field — a deliberate user edit (AddToLibrary)
+// should win over whatever's embedded in the file itself, which is all
+// mpd's own Status/CurrentSong can ever report, and which AddToLibrary
+// only ever updates in the index, never in the file. See lookupEnrichment
+// for why this never blocks Status on the indexer's response time.
 func (p *Player) enrichStatus(status mpdclient.Status) mpdclient.Status {
-	if p.indexer == nil || status.Song == "" {
-		return status
-	}
-
-	p.statusMu.Lock()
-	if p.statusURL != status.Song {
-		p.statusURL = status.Song
-		p.statusResult = indexer.Result{}
-		p.statusResolved = false
-		p.statusMu.Unlock()
-		go p.refreshStatusEnrichment(status.Song)
-		return status
-	}
-	result, resolved := p.statusResult, p.statusResolved
-	p.statusMu.Unlock()
-
+	result, resolved := p.lookupEnrichment(status.Song)
 	if !resolved {
 		return status
 	}
@@ -461,13 +445,57 @@ func (p *Player) enrichStatus(status mpdclient.Status) mpdclient.Status {
 	return status
 }
 
-// refreshStatusEnrichment looks url up in the search index and caches the
-// answer for enrichStatus, unless the currently playing URL has already
-// moved on to something else by the time this goroutine runs.
-func (p *Player) refreshStatusEnrichment(url string) {
+// lookupEnrichment returns the search index's cached answer for url, if
+// already known, and kicks off a background lookup the first time url is
+// ever asked about — never blocking the caller on the indexer's response
+// time. Shared by Status (a single "currently playing" URL, polled once a
+// second while playing per cmd/pi-streamer's ticker) and Queue (every
+// currently queued URL, potentially many at once) — both need the exact
+// same "override mpd's own tag/URL-derived fallback with the index's
+// title/artist/album, once known" behavior, and calling Indexer.Get
+// directly from either on every invocation would gate that call's
+// throughput on the search-indexer service's own latency/availability —
+// exactly the class of bug already fixed once for the play-time indexing
+// path (see indexAsync's doc comment).
+//
+// resolved=false (a cache miss, or a lookup still in flight) means the
+// caller should keep whatever it already had (mpd's own tag, or a
+// URL-derived fallback) — the enriched value shows up on a later call once
+// the background lookup finishes, typically well under either caller's
+// poll interval for a healthy indexer.
+//
+// enrichCache is keyed by URL and never pruned, unlike an earlier version
+// that only ever cached a single "current song" slot — deliberate: Queue
+// can have many simultaneously-displayed tracks, each needing its own
+// cached answer, and a personal-scale library's worth of distinct URLs
+// accumulated over one daemon run (each entry a few small strings) isn't
+// worth adding LRU eviction for.
+func (p *Player) lookupEnrichment(url string) (indexer.Result, bool) {
+	if p.indexer == nil || url == "" {
+		return indexer.Result{}, false
+	}
+
+	p.enrichMu.Lock()
+	entry, cached := p.enrichCache[url]
+	if !cached {
+		if p.enrichCache == nil {
+			p.enrichCache = make(map[string]enrichedResult)
+		}
+		p.enrichCache[url] = enrichedResult{}
+		p.enrichMu.Unlock()
+		go p.refreshEnrichment(url)
+		return indexer.Result{}, false
+	}
+	p.enrichMu.Unlock()
+	return entry.result, entry.resolved
+}
+
+// refreshEnrichment looks url up in the search index and caches the
+// answer for lookupEnrichment.
+func (p *Player) refreshEnrichment(url string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("panic in status enrichment: %v\n%s", r, debug.Stack())
+			log.Printf("panic in metadata enrichment lookup for %s: %v\n%s", url, r, debug.Stack())
 		}
 	}()
 
@@ -476,28 +504,26 @@ func (p *Player) refreshStatusEnrichment(url string) {
 		return
 	}
 
-	p.statusMu.Lock()
-	defer p.statusMu.Unlock()
-	if p.statusURL == url {
-		p.statusResult = result
-		p.statusResolved = true
-	}
+	p.enrichMu.Lock()
+	defer p.enrichMu.Unlock()
+	p.enrichCache[url] = enrichedResult{result: result, resolved: true}
 }
 
-// invalidateStatusEnrichment forces a fresh index lookup for url on its
-// next Status() call, if url happens to be the currently cached/playing
-// song. Needed because enrichStatus's cache otherwise only ever refreshes
-// when the *song* changes — editing a track's metadata (AddToLibrary)
-// while that exact track is already playing doesn't change status.Song at
-// all, so without this, an edit made mid-playback would never show up
-// until the next track started, which is exactly the bug this whole
-// enrichment mechanism was built to fix in the first place.
-func (p *Player) invalidateStatusEnrichment(url string) {
-	p.statusMu.Lock()
-	playing := p.statusURL == url
-	p.statusMu.Unlock()
-	if playing {
-		go p.refreshStatusEnrichment(url)
+// invalidateEnrichment forces a fresh index lookup for url on its next
+// Status()/Queue() call, if url is already cached at all. Needed because
+// lookupEnrichment's cache otherwise only ever gets populated the first
+// time a URL is seen — editing a track's metadata (AddToLibrary) doesn't
+// go through lookupEnrichment itself, so without this, an edit would never
+// show up until the process restarted (there's no "song changed" event to
+// naturally trigger a re-lookup the way there once was for a single-slot
+// cache), which is exactly the bug this whole enrichment mechanism was
+// built to fix in the first place.
+func (p *Player) invalidateEnrichment(url string) {
+	p.enrichMu.Lock()
+	_, cached := p.enrichCache[url]
+	p.enrichMu.Unlock()
+	if cached {
+		go p.refreshEnrichment(url)
 	}
 }
 
@@ -574,7 +600,18 @@ func (p *Player) History(limit int) ([]store.Track, error) {
 }
 
 // Queue returns mpd's current live playback queue, distinct from the app's
-// own saved named playlists in internal/store.
+// own saved named playlists in internal/store. Every entry's Title/Artist
+// gets the exact same search-index-enrichment treatment Status's Title/
+// Artist/Album already gets (see enrichStatus/lookupEnrichment) — a
+// deliberate user edit (AddToLibrary) should win over mpd's own tag in the
+// Queue view too, not just in "now playing"; only once that has nothing
+// does an entry fall back to deriveTitleFromURL, same ordering as Status.
+// This matters well beyond metadata edits: mpd's own Title tag is often
+// simply empty for a URL it has no embedded tags for, and deriving a
+// fallback straight from the URL produces useless results for some
+// sources (e.g. a bare YouTube watch link's path is just "/watch") where
+// the search index, once its own async enrichment completes, has a real
+// title to offer instead.
 func (p *Player) Queue() ([]mpdclient.QueueTrack, error) {
 	queue, err := p.mpd.Queue()
 	if err != nil {
@@ -582,6 +619,14 @@ func (p *Player) Queue() ([]mpdclient.QueueTrack, error) {
 	}
 	for i := range queue {
 		queue[i].URL = p.unresolve(queue[i].URL)
+		if result, resolved := p.lookupEnrichment(queue[i].URL); resolved {
+			if result.Title != "" {
+				queue[i].Title = result.Title
+			}
+			if result.Artist != "" {
+				queue[i].Artist = result.Artist
+			}
+		}
 		if queue[i].Title == "" {
 			queue[i].Title = deriveTitleFromURL(queue[i].URL)
 		}

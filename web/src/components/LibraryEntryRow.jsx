@@ -1,5 +1,6 @@
 import { ActionIcon, Anchor, Badge, Card, Group, Menu, Stack, Text } from '@mantine/core'
 import {
+  IconBrandYoutube,
   IconDisc,
   IconDotsVertical,
   IconHeart,
@@ -11,6 +12,7 @@ import {
   IconTrash,
   IconUser,
 } from '@tabler/icons-react'
+import { isYouTubeUrl } from '../isYouTubeUrl.js'
 
 // One track's list-view row — used by every track-based sub-view
 // (Tracks/Albums/Artists/Favorites/search results). Play/Queue/Favorite
@@ -53,6 +55,11 @@ function LibraryEntryRow({
             >
               {entry.title || entry.url}
             </Anchor>
+            {isYouTubeUrl(entry.url) && (
+              <span title="From YouTube" style={{ display: 'inline-flex', flexShrink: 0 }}>
+                <IconBrandYoutube size={16} color="var(--mantine-color-red-6)" />
+              </span>
+            )}
             {isPlaying && (
               <Badge size="xs" color="blue" variant="light">
                 Now Playing

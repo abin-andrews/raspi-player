@@ -46,6 +46,17 @@ type fakeArt struct {
 	queryCalls  [][]string
 
 	warmCalled bool
+
+	suggestResult []MetadataSuggestion
+	suggestErr    error
+	suggestCalls  []string
+
+	setCustomArtResult ArtStatus
+	setCustomArtErr    error
+	setCustomArtCalls  [][3]string // [scope, key, imageUrl]
+
+	clearCustomArtErr   error
+	clearCustomArtCalls [][2]string // [scope, key]
 }
 
 func newFakeArt() *fakeArt {
@@ -71,6 +82,21 @@ func (f *fakeArt) Query(urls []string) map[string]ArtStatus {
 
 func (f *fakeArt) Warm() {
 	f.warmCalled = true
+}
+
+func (f *fakeArt) Suggest(query string) ([]MetadataSuggestion, error) {
+	f.suggestCalls = append(f.suggestCalls, query)
+	return f.suggestResult, f.suggestErr
+}
+
+func (f *fakeArt) SetCustomArt(scope, key, imageURL string) (ArtStatus, error) {
+	f.setCustomArtCalls = append(f.setCustomArtCalls, [3]string{scope, key, imageURL})
+	return f.setCustomArtResult, f.setCustomArtErr
+}
+
+func (f *fakeArt) ClearCustomArt(scope, key string) error {
+	f.clearCustomArtCalls = append(f.clearCustomArtCalls, [2]string{scope, key})
+	return f.clearCustomArtErr
 }
 
 // fakeJobs is a minimal in-memory Jobs implementation for handler tests.
@@ -774,6 +800,158 @@ func TestHandleRefreshAlbumArtError(t *testing.T) {
 	}
 }
 
+func TestHandleSuggestMetadata(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.suggestResult = []MetadataSuggestion{
+		{Title: "Track One", Artist: "Some Artist", Album: "Some Album"},
+	}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/suggest", `{"query":"track one some artist"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Suggestions []MetadataSuggestion `json:"suggestions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Suggestions) != 1 || got.Suggestions[0] != art.suggestResult[0] {
+		t.Errorf("body = %+v, want %+v", got.Suggestions, art.suggestResult)
+	}
+	if len(art.suggestCalls) != 1 || art.suggestCalls[0] != "track one some artist" {
+		t.Errorf("suggestCalls = %v, want one entry for the submitted query", art.suggestCalls)
+	}
+}
+
+func TestHandleSuggestMetadataBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/suggest", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSuggestMetadataRequiresQuery(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/suggest", `{"query":""}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSuggestMetadataError(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.suggestErr = errors.New("musicbrainz unreachable")
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/suggest", `{"query":"anything"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleSetCustomArt(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.setCustomArtResult = ArtStatus{HasArt: true, Path: "/art/custom123.jpg"}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/custom",
+		`{"scope":"album","key":"Rumours","imageUrl":"https://example.com/cover.jpg"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got ArtStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != art.setCustomArtResult {
+		t.Errorf("body = %+v, want %+v", got, art.setCustomArtResult)
+	}
+	want := [3]string{"album", "Rumours", "https://example.com/cover.jpg"}
+	if len(art.setCustomArtCalls) != 1 || art.setCustomArtCalls[0] != want {
+		t.Errorf("setCustomArtCalls = %v, want [%v]", art.setCustomArtCalls, want)
+	}
+}
+
+func TestHandleSetCustomArtBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/custom", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSetCustomArtRequiresAllFields(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/custom", `{"scope":"track","key":"","imageUrl":"https://example.com/a.jpg"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleSetCustomArtError(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.setCustomArtErr = errors.New("fetch failed")
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/custom",
+		`{"scope":"track","key":"http://example.com/a.mp3","imageUrl":"https://example.com/a.jpg"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleClearCustomArt(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "DELETE", "/api/albumart/custom", `{"scope":"artist","key":"Fleetwood Mac"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	want := [2]string{"artist", "Fleetwood Mac"}
+	if len(art.clearCustomArtCalls) != 1 || art.clearCustomArtCalls[0] != want {
+		t.Errorf("clearCustomArtCalls = %v, want [%v]", art.clearCustomArtCalls, want)
+	}
+}
+
+func TestHandleClearCustomArtBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "DELETE", "/api/albumart/custom", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleClearCustomArtError(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.clearCustomArtErr = errors.New("boom")
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "DELETE", "/api/albumart/custom", `{"scope":"track","key":"http://example.com/a.mp3"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
 func TestHandleListJobs(t *testing.T) {
 	p := newFakePlayer()
 	j := newFakeJobs()
@@ -1140,6 +1318,34 @@ func TestHandleSetConfigEmptyPortSkipsValidation(t *testing.T) {
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"","baud":0}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (empty port means \"disabled\", always allowed); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleSetConfigNegativeElapsedUpdateInterval(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"elapsedUpdateIntervalSeconds":-1}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(cfg.setCalls) != 0 {
+		t.Errorf("setCalls = %+v, want none (validation should reject before Set)", cfg.setCalls)
+	}
+}
+
+func TestHandleSetConfigValidElapsedUpdateInterval(t *testing.T) {
+	p := newFakePlayer()
+	cfg := newFakeConfig()
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
+
+	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"elapsedUpdateIntervalSeconds":5}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(cfg.setCalls) != 1 || cfg.setCalls[0].OLED.ElapsedUpdateIntervalSeconds != 5 {
+		t.Errorf("setCalls = %+v, want one call with ElapsedUpdateIntervalSeconds=5", cfg.setCalls)
 	}
 }
 

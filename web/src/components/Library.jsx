@@ -46,6 +46,7 @@ import {
 import { useCachedUrls } from '../hooks/useCachedUrls.js'
 import { useAlbumArtStatus } from '../hooks/useAlbumArtStatus.js'
 import { useLocalStorageState } from '../hooks/useLocalStorageState.js'
+import CustomArtControl from './CustomArtControl.jsx'
 import LibraryEntryForm from './LibraryEntryForm.jsx'
 import LibraryEntryRow from './LibraryEntryRow.jsx'
 import LibraryEntryGridCard from './LibraryEntryGridCard.jsx'
@@ -535,6 +536,12 @@ function Library({ status }) {
             Delete
           </Button>
         </Group>
+        <CustomArtControl
+          scope="track"
+          artKey={entry.url}
+          label={entry.title || entry.url}
+          onChanged={() => handleRefreshArt(entry)}
+        />
       </Stack>
     )
   }
@@ -675,6 +682,7 @@ function Library({ status }) {
           <Text size="xs" c="dimmed">
             {tracks.length} track{tracks.length === 1 ? '' : 's'}
           </Text>
+          <CustomArtControl scope="album" artKey={value} label={value} />
           {renderEntryList(tracks)}
         </Stack>
       )
@@ -689,6 +697,7 @@ function Library({ status }) {
           {tracks.length} track{tracks.length === 1 ? '' : 's'} across {albumGroups.length} album
           {albumGroups.length === 1 ? '' : 's'}
         </Text>
+        <CustomArtControl scope="artist" artKey={value} label={value} />
         {albumGroups.map(([album, albumTracks]) => (
           <Stack key={album} gap="xs">
             {album === '(Unknown)' ? (

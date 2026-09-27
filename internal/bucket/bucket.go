@@ -162,27 +162,55 @@ func (s *Store) SetMinFree(minFreeBytes int64) {
 	s.minFreeBytes = minFreeBytes
 }
 
-// keyFor derives a stable filename for url: a content hash (so arbitrary
-// URL characters/length are never a filesystem concern) plus a best-effort
-// extension (cosmetic only — nothing parses it back).
-func keyFor(url string) string {
+// hashFor is url's content-addressed identity, shared by keyFor (which
+// adds a URL-guessed extension) and DownloadVia (which instead preserves
+// the extension of whatever file its fetch callback actually produced).
+func hashFor(url string) string {
 	sum := sha256.Sum256([]byte(url))
-	ext := ".audio"
-	if i := strings.IndexAny(url, "?#"); i >= 0 {
-		url = url[:i]
+	return hex.EncodeToString(sum[:])
+}
+
+// keyFor derives a stable filename for url: hashFor's content hash (so
+// arbitrary URL characters/length are never a filesystem concern) plus a
+// best-effort extension guessed from the URL itself (cosmetic only —
+// nothing parses it back). Used by Download/Lookup/Contains, where the
+// URL is a plain HTTP one and its own path usually does carry a real
+// extension; DownloadVia can't use this, since e.g. a YouTube watch link
+// carries no such information at all.
+func keyFor(url string) string {
+	hash := hashFor(url) // computed on the full, untruncated url
+	extSource := url
+	if i := strings.IndexAny(extSource, "?#"); i >= 0 {
+		extSource = extSource[:i]
 	}
-	if e := filepath.Ext(url); e != "" && len(e) <= 5 {
+	ext := ".audio"
+	if e := filepath.Ext(extSource); e != "" && len(e) <= 5 {
 		ext = e
 	}
-	return hex.EncodeToString(sum[:]) + ext
+	return hash + ext
+}
+
+// find locates url's cached file regardless of which extension it was
+// actually stored under: Download guesses one from the URL itself
+// (keyFor), but DownloadVia instead preserves whatever its fetch callback
+// produced (see its own doc comment for why — a URL like a YouTube watch
+// link carries no usable extension at all) — so Contains/Lookup/Remove
+// can't assume keyFor's guess is the real filename and must search by
+// hash prefix instead, matching either naming convention.
+func (s *Store) find(url string) (string, bool) {
+	matches, err := filepath.Glob(filepath.Join(s.dir, hashFor(url)+".*"))
+	if err != nil || len(matches) == 0 {
+		return "", false
+	}
+	return matches[0], true
 }
 
 // Contains reports whether url is already cached, without affecting its
 // LRU recency — for UI "is this cached?" queries, which shouldn't count as
 // a use.
 func (s *Store) Contains(url string) bool {
-	_, err := os.Stat(filepath.Join(s.dir, keyFor(url)))
-	return err == nil
+	_, ok := s.find(url)
+	return ok
 }
 
 // FilePath resolves a cache filename (as returned by Lookup/Download via
@@ -226,8 +254,8 @@ func (s *Store) URLForFilename(name string) (string, bool) {
 // its recency for LRU purposes (this is the actual-playback path, not the
 // UI-status path — see Contains for that).
 func (s *Store) Lookup(url string) (path string, ok bool) {
-	p := filepath.Join(s.dir, keyFor(url))
-	if _, err := os.Stat(p); err != nil {
+	p, ok := s.find(url)
+	if !ok {
 		return "", false
 	}
 	now := time.Now()
@@ -302,6 +330,61 @@ func (s *Store) Download(ctx context.Context, url string) (string, error) {
 	// this succeeds, so a failure here doesn't fail the download — it only
 	// means this entry shows up with a blank URL in List() until the next
 	// successful save.
+	_ = s.saveIndexLocked()
+	return finalPath, nil
+}
+
+// DownloadVia is Download's general form, for a source mpd can't be
+// pointed at directly and that isn't a plain HTTP GET either — e.g.
+// internal/ytdlp extracting a YouTube video's audio track via the yt-dlp
+// CLI. fetch does the actual work of producing the file: it must create a
+// new file *inside* dir (the exact path is fetch's choice, e.g. via
+// os.CreateTemp(dir, ...) or a tool's own output flag pointed into dir)
+// and return that path — DownloadVia takes it from there: sizing it,
+// making room within the size cap and safety margin (see
+// makeRoomLocked), and atomically renaming it into place under url's
+// content-addressed name, exactly as Download does after its own HTTP
+// GET. fetch's output file's own extension (whatever it actually wrote,
+// e.g. ".m4a"/".opus") is preserved on the final name — unlike Download's
+// keyFor, which guesses an extension from the URL itself, since a URL
+// like a YouTube watch link carries no such information at all.
+//
+// The file must land on the same filesystem as dir: the final step is a
+// rename, and a rename across filesystems doesn't work at all (or, on
+// some platforms, silently degrades to a slow copy) — this is exactly why
+// fetch is required to create its file inside dir to begin with, rather
+// than anywhere convenient.
+func (s *Store) DownloadVia(ctx context.Context, url string, fetch func(dir string) (path string, err error)) (string, error) {
+	tmpPath, err := fetch(s.dir)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("stat fetched file: %w", err)
+	}
+
+	ext := filepath.Ext(tmpPath)
+	if ext == "" {
+		ext = ".audio"
+	}
+	finalName := hashFor(url) + ext
+	finalPath := filepath.Join(s.dir, finalName)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.makeRoomLocked(info.Size(), finalPath); err != nil {
+		os.Remove(tmpPath)
+		return "", err
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("finalize download: %w", err)
+	}
+	s.urls[finalName] = url
+	// Best-effort, same reasoning as Download's own save: the file itself
+	// landed fine regardless of whether this succeeds.
 	_ = s.saveIndexLocked()
 	return finalPath, nil
 }
@@ -470,11 +553,24 @@ func (s *Store) List() ([]Entry, error) {
 // a permanent favorites-archive copy when a favorite is removed, where the
 // archive download may never have succeeded in the first place.
 func (s *Store) Remove(url string) error {
-	name := keyFor(url)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove cached file: %w", err)
+
+	path, found := s.find(url)
+	if found {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove cached file: %w", err)
+		}
+	}
+	// Also drop the index entry by its actual name, whether or not the
+	// file itself was still there — found's guessed name (keyFor's) might
+	// not match what's actually indexed if this entry came from
+	// DownloadVia, so look the real name up from found's path when
+	// available, falling back to keyFor's guess otherwise (nothing else
+	// to try if the file is already gone).
+	name := keyFor(url)
+	if found {
+		name = filepath.Base(path)
 	}
 	if _, ok := s.urls[name]; ok {
 		delete(s.urls, name)

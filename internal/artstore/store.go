@@ -24,11 +24,17 @@ import (
 
 const indexFileName = ".index.json"
 
-// entry is one URL's resolved state. Filename is empty when HasArt is
+// entry is one key's resolved state. Filename is empty when HasArt is
 // false (a confirmed "no art" result) — there's nothing on disk for it.
+// Custom marks an entry set via PutCustom (a user-provided image, fetched
+// from a URL they gave rather than found via mpd/YouTube/MusicBrainz) —
+// callers doing auto-resolution (cmd/pi-streamer's artAdapter) check this
+// so a deliberate user choice is never silently overwritten by a later
+// Resolve/Refresh/Warm.
 type entry struct {
 	Filename string `json:"filename"`
 	HasArt   bool   `json:"hasArt"`
+	Custom   bool   `json:"custom,omitempty"`
 }
 
 // Store is safe for concurrent use.
@@ -105,6 +111,63 @@ func (s *Store) Put(url string, data []byte) (filename string, hasArt bool, err 
 func keyFor(url string) string {
 	sum := sha256.Sum256([]byte(url))
 	return hex.EncodeToString(sum[:])
+}
+
+// PutCustom records data as key's art, marked Custom so IsCustom(key)
+// reports true for it afterward — a user-provided override (fetched from
+// a URL they gave, not found via auto-resolution) that callers doing
+// auto-resolution should treat as authoritative and never silently
+// replace. Unlike Put, empty data is rejected as an error rather than
+// recorded as a confirmed "no art" result: setting custom art is always
+// meant to end with real art in place, so an empty fetch is a failure,
+// not an answer worth caching.
+func (s *Store) PutCustom(key string, data []byte) (filename string, err error) {
+	if len(data) == 0 {
+		return "", fmt.Errorf("artstore: no image data to set as custom art for %q", key)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	name := keyFor(key) + extFor(data)
+	if err := os.WriteFile(filepath.Join(s.dir, name), data, 0o644); err != nil {
+		return "", fmt.Errorf("artstore: write %q: %w", name, err)
+	}
+	s.index[key] = entry{Filename: name, HasArt: true, Custom: true}
+	if err := s.saveIndexLocked(); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// IsCustom reports whether key's currently-recorded entry (if any) was
+// set via PutCustom rather than auto-resolved via Put.
+func (s *Store) IsCustom(key string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.index[key].Custom
+}
+
+// Remove deletes key's recorded entry (custom or not) and its file, if
+// any, reverting it to "unknown" — a plain Put/PutCustom-less absence,
+// not a confirmed "no art" result — so the next Resolve re-runs
+// auto-resolution from scratch instead of treating it as already
+// answered. Not an error if key was never recorded.
+func (s *Store) Remove(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.index[key]
+	if !ok {
+		return nil
+	}
+	if e.Filename != "" {
+		if err := os.Remove(filepath.Join(s.dir, e.Filename)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("artstore: remove %q: %w", e.Filename, err)
+		}
+	}
+	delete(s.index, key)
+	return s.saveIndexLocked()
 }
 
 // extFor picks a file extension so the static file server (which maps

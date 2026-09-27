@@ -23,7 +23,7 @@ const ART_SIZE = 48
 // so this component still renders standalone if a caller has no use for
 // that (there's no other caller today, but nothing here should require
 // it).
-function PlayerBar({ status, onExpand }) {
+function PlayerBar({ status, onExpand, hideVolumeControl }) {
   const {
     showArt,
     setArtFailed,
@@ -150,24 +150,32 @@ function PlayerBar({ status, onExpand }) {
         </Group>
       </Stack>
 
-      <Group wrap="nowrap" gap="xs" style={{ flex: '0 0 auto' }}>
-        <ActionIcon
-          variant="subtle"
-          onClick={handleMuteToggle}
-          aria-label={volume > 0 ? 'Mute' : 'Unmute'}
-        >
-          {volume > 0 ? <IconVolume2 size={18} /> : <IconVolumeOff size={18} />}
-        </ActionIcon>
-        <Slider
-          w={100}
-          size="sm"
-          value={dragVolume ?? volume}
-          min={0}
-          max={100}
-          onChange={setDragVolume}
-          onChangeEnd={handleVolumeChangeEnd}
-          label={(value) => `${value}%`}
-        />
+      {/* Fixed minWidth (not flex: 1) reserves the same footprint whether
+          or not the volume control renders inside it, so hiding it never
+          shifts the centered transport controls — matches the slot's width
+          when the mute icon + 100px slider are actually shown. */}
+      <Group wrap="nowrap" gap="xs" justify="flex-end" style={{ flex: '0 0 auto', minWidth: 140 }}>
+        {!hideVolumeControl && (
+          <>
+            <ActionIcon
+              variant="subtle"
+              onClick={handleMuteToggle}
+              aria-label={volume > 0 ? 'Mute' : 'Unmute'}
+            >
+              {volume > 0 ? <IconVolume2 size={18} /> : <IconVolumeOff size={18} />}
+            </ActionIcon>
+            <Slider
+              w={100}
+              size="sm"
+              value={dragVolume ?? volume}
+              min={0}
+              max={100}
+              onChange={setDragVolume}
+              onChangeEnd={handleVolumeChangeEnd}
+              label={(value) => `${value}%`}
+            />
+          </>
+        )}
       </Group>
     </Group>
   )
