@@ -82,6 +82,14 @@ func newTestServer(t *testing.T) *httptest.Server {
 		})
 	})
 
+	mux.HandleFunc("DELETE /index", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("url") == "" {
+			http.Error(w, "missing url", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	return httptest.NewServer(mux)
 }
 
@@ -266,6 +274,43 @@ func TestGetNotFound(t *testing.T) {
 	}
 	if ok {
 		t.Error("Get ok = true, want false for an unindexed URL")
+	}
+}
+
+func TestDeleteSuccess(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /index", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	if err := c.Delete("https://example.com/a"); err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if gotQuery != "url=https%3A%2F%2Fexample.com%2Fa" {
+		t.Errorf("query = %q, want the url param encoded", gotQuery)
+	}
+}
+
+func TestDeleteError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /index", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := New(srv.URL)
+	err := c.Delete("https://example.com/a")
+	if err == nil {
+		t.Fatal("Delete: want error for a 500 response, got nil")
+	}
+	if !strings.Contains(err.Error(), "500") && !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %q, want it to mention the status code or body", err.Error())
 	}
 }
 

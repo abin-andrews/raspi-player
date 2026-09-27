@@ -29,6 +29,7 @@ func main() {
 	mux.HandleFunc("GET /search", handleSearch(idx))
 	mux.HandleFunc("GET /list", handleList(idx))
 	mux.HandleFunc("GET /get", handleGet(idx))
+	mux.HandleFunc("DELETE /index", handleDelete(idx))
 
 	log.Printf("search-indexer listening on %s (db: %s)", *httpAddr, *dbPath)
 	if err := http.ListenAndServe(*httpAddr, mux); err != nil {
@@ -75,6 +76,21 @@ func handleGet(idx *search.Index) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
+	}
+}
+
+func handleDelete(idx *search.Index) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		url := r.URL.Query().Get("url")
+		if url == "" {
+			http.Error(w, "missing url query parameter", http.StatusBadRequest)
+			return
+		}
+		if err := idx.Delete(url); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

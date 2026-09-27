@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"pi-streamer/internal/mpdclient"
 )
 
 func TestOledTruncateLeavesShortStringsAlone(t *testing.T) {
@@ -66,5 +68,47 @@ func TestTruncateOLEDLineNeverProducesNegativeLength(t *testing.T) {
 	got := truncateOLEDLine(parts)
 	if len(got[1]) != 0 {
 		t.Errorf("value = %q, want empty when even the command name overflows the budget", got[1])
+	}
+}
+
+// updateOLEDTrack's send calls are unobservable without a real serial
+// device (m.client stays nil in every test here, making send() a safe
+// no-op — see its own doc comment), but the change-detection decision
+// that drives *whether* it does a full redraw is itself pure Go logic
+// living in the same function; these tests check that decision via its
+// only other observable effect, the lastTitle/lastArtist/lastAlbum/
+// lastState fields it caches.
+func TestUpdateOLEDTrackCachesWhatItSent(t *testing.T) {
+	m := &oledManager{}
+	updateOLEDTrack(m, mpdclient.Status{Title: "Title A", Artist: "Artist A", Album: "Album A", State: "play"})
+
+	if m.lastTitle != "Title A" || m.lastArtist != "Artist A" || m.lastAlbum != "Album A" || m.lastState != "play" {
+		t.Errorf("cached fields = %+v, want them to match what was just sent", m)
+	}
+}
+
+func TestUpdateOLEDTrackDetectsAnAlbumChangeWithNoOtherFieldChanged(t *testing.T) {
+	// This is the exact bug this fix targets: editing a track's metadata
+	// (internal/player.Player.AddToLibrary) while it's already playing
+	// changes Album with nothing else about the track changing — no new
+	// Title, no State transition, nothing mpd itself would ever generate
+	// an idle event for. The old design decided whether to redraw based on
+	// SongID alone (tracked by the caller, not here) and would have missed
+	// this entirely; this function must detect it from the fields
+	// themselves instead.
+	m := &oledManager{lastTitle: "Title A", lastArtist: "Artist A", lastAlbum: "Original Album", lastState: "play"}
+	updateOLEDTrack(m, mpdclient.Status{Title: "Title A", Artist: "Artist A", Album: "Edited Album", State: "play"})
+
+	if m.lastAlbum != "Edited Album" {
+		t.Errorf("lastAlbum = %q, want it updated to the newly edited album", m.lastAlbum)
+	}
+}
+
+func TestUpdateOLEDTrackFallsBackToSongWhenTitleIsEmpty(t *testing.T) {
+	m := &oledManager{}
+	updateOLEDTrack(m, mpdclient.Status{Song: "http://example.com/a.mp3", State: "play"})
+
+	if m.lastTitle != "http://example.com/a.mp3" {
+		t.Errorf("lastTitle = %q, want the URL fallback cached the same way it's sent", m.lastTitle)
 	}
 }

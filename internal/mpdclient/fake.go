@@ -73,6 +73,15 @@ func (c *FakeClient) Add(uri string) error {
 	return nil
 }
 
+// AddGetID appends uri the same way Add does, and returns the id assigned
+// to it.
+func (c *FakeClient) AddGetID(uri string) (int, error) {
+	if err := c.Add(uri); err != nil {
+		return -1, err
+	}
+	return c.QueueTracks[len(c.QueueTracks)-1].ID, nil
+}
+
 // Play sets the state to "play". If no song is current yet and the
 // playlist is non-empty, it selects the first song.
 func (c *FakeClient) Play() error {

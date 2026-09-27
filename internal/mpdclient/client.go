@@ -5,6 +5,8 @@
 package mpdclient
 
 import (
+	"errors"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -16,8 +18,11 @@ import (
 type Status struct {
 	// State is the player state, e.g. "play", "pause", or "stop".
 	State string `json:"state"`
-	// Song is the URI (or title, if available) of the current song.
-	// Empty if nothing is loaded.
+	// Song is the URI of the current song — always the URI, never a
+	// display title (Title, below, is the separate field for that). Empty
+	// if nothing is loaded. Callers that key off a track's identity (album
+	// art lookup by URL, matching a queue/library entry to "now playing")
+	// depend on this being the actual URI unconditionally.
 	Song string `json:"song"`
 	// Artist is the current song's artist, if known.
 	Artist string `json:"artist"`
@@ -53,6 +58,11 @@ type QueueTrack struct {
 type Client interface {
 	// Add adds a URL to the current playlist.
 	Add(uri string) error
+	// AddGetID adds a URL to the end of the current playlist and returns
+	// the queue id assigned to it, so the caller can immediately move/play
+	// that specific entry (see PlayURL) rather than whatever mpd's "current
+	// song" pointer happens to already be on.
+	AddGetID(uri string) (int, error)
 	// Play starts or resumes playback.
 	Play() error
 	// Pause pauses playback.
@@ -92,24 +102,54 @@ type Client interface {
 // background broadcast loop may call Status() concurrently with
 // HTTP-handler-triggered command calls on the same underlying connection,
 // and mpd's text protocol is not safe for concurrent use.
+//
+// AlbumArt gets its own dedicated connection (artConn/artMu) rather than
+// sharing conn/mu: gompd's ReadPicture/AlbumArt fetch mpd's "readpicture"/
+// "albumart" binary response in a loop, one mpd command per chunk (mpd
+// caps each response around a few KB), so a single embedded-art fetch can
+// mean dozens of round trips to mpd — all held under one lock/unlock pair
+// for the whole call. Sharing conn/mu would mean an in-flight art fetch
+// (e.g. a Library grid rendering many thumbnails at once) blocks every
+// Status() call the 1s ticker makes for its whole duration, stalling the
+// UI/OLED. If a second connection can't be opened for some reason,
+// artConn falls back to conn (see Dial) and AlbumArt falls back to
+// locking mu instead — degraded (back to the contention this avoids) but
+// not broken, since album art is best-effort already.
 type GompdClient struct {
 	mu   sync.Mutex
 	conn *mpd.Client
+
+	artMu   sync.Mutex
+	artConn *mpd.Client
 }
 
 // Dial connects to an mpd server listening on address addr (e.g.
 // "127.0.0.1:6600") over network network (e.g. "tcp"), returning a
-// GompdClient wrapping the connection.
+// GompdClient wrapping the connection. It also opens a second, dedicated
+// connection for AlbumArt (see GompdClient's doc comment) — best-effort;
+// if that second dial fails, AlbumArt falls back to sharing the primary
+// connection rather than failing the whole daemon over it.
 func Dial(network, addr string) (*GompdClient, error) {
 	conn, err := mpd.Dial(network, addr)
 	if err != nil {
 		return nil, err
 	}
-	return &GompdClient{conn: conn}, nil
+	artConn, err := mpd.Dial(network, addr)
+	if err != nil {
+		log.Printf("mpdclient: dedicated album-art connection unavailable, album art will share the "+
+			"primary mpd connection instead: %v", err)
+		artConn = conn
+	}
+	return &GompdClient{conn: conn, artConn: artConn}, nil
 }
 
-// Close closes the underlying mpd connection.
+// Close closes the underlying mpd connection(s).
 func (c *GompdClient) Close() error {
+	if c.artConn != c.conn {
+		c.artMu.Lock()
+		c.artConn.Close()
+		c.artMu.Unlock()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.Close()
@@ -120,6 +160,14 @@ func (c *GompdClient) Add(uri string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.Add(uri)
+}
+
+// AddGetID adds a URL to the end of the current playlist and returns the
+// queue id assigned to it.
+func (c *GompdClient) AddGetID(uri string) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.AddID(uri, -1)
 }
 
 // Play starts/resumes playback at the current position in the playlist.
@@ -161,11 +209,14 @@ func (c *GompdClient) Status() (Status, error) {
 	status.SongID, _ = strconv.Atoi(attrs["songid"])
 
 	if song, err := c.conn.CurrentSong(); err == nil {
-		if title, ok := song["Title"]; ok && title != "" {
-			status.Song = title
-		} else {
-			status.Song = song["file"]
-		}
+		// Song is always the URI — never falls back to Title. An earlier
+		// version preferred Title here (when present) with file as the
+		// fallback, which broke every URL-keyed use of Song (album art
+		// lookup by URL, matching a queue/library row to "now playing") for
+		// any track with an embedded Title tag, i.e. most of them; Title
+		// already exists as its own field for display, so that fallback
+		// was pure redundancy with a real cost, not a deliberate choice.
+		status.Song = song["file"]
 		status.Artist = song["Artist"]
 		status.Album = song["Album"]
 		status.Title = song["Title"]
@@ -213,13 +264,38 @@ func (c *GompdClient) SetVolume(volume int) error {
 // embedded tag art via mpd's readpicture command, falling back to a cover
 // file via mpd's albumart command if that fails or returns no data.
 func (c *GompdClient) AlbumArt(uri string) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.artConn == c.conn {
+		// No dedicated connection was available at Dial time — fall back
+		// to the shared one, guarded by the same mutex as every other
+		// method (see GompdClient's doc comment).
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return fetchAlbumArt(c.conn, uri)
+	}
+	c.artMu.Lock()
+	defer c.artMu.Unlock()
+	return fetchAlbumArt(c.artConn, uri)
+}
 
-	if data, err := c.conn.ReadPicture(uri); err == nil && len(data) > 0 {
+func fetchAlbumArt(conn *mpd.Client, uri string) ([]byte, error) {
+	if data, err := conn.ReadPicture(uri); err == nil && len(data) > 0 {
 		return data, nil
 	}
-	return c.conn.AlbumArt(uri)
+	data, err := conn.AlbumArt(uri)
+	if err != nil {
+		var mpdErr mpd.Error
+		if errors.As(err, &mpdErr) {
+			// mpd itself definitively answered — no cover file, no such
+			// song, etc. (a real ACK response, meaning mpd is alive and
+			// processed the command) — that's a confirmed "no art"
+			// result, not a failure, so the caller (internal/api's
+			// album-art cache) can cache it as such rather than treating
+			// it the same as a genuine connection/protocol error.
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
 }
 
 // Queue returns the current playback queue, translated from mpd's

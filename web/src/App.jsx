@@ -1,33 +1,46 @@
-import { AppShell, Badge, Center, Container, Loader, Stack, Text, Tabs, Title } from '@mantine/core'
-import { IconBooks, IconDatabase, IconDownload, IconSearch, IconSettings } from '@tabler/icons-react'
+import { useState } from 'react'
+import {
+  ActionIcon,
+  AppShell,
+  Badge,
+  Center,
+  Container,
+  Group,
+  Loader,
+  Modal,
+  Stack,
+  Text,
+  Tabs,
+} from '@mantine/core'
+import { IconBooks, IconDownload, IconLoader2, IconPlaylist, IconSettings } from '@tabler/icons-react'
 import { useDaemonSocket } from './hooks/useDaemonSocket.js'
 import { useHashTab } from './hooks/useHashTab.js'
-import NowPlaying from './components/NowPlaying.jsx'
-import Favorites from './components/Favorites.jsx'
-import Playlists from './components/Playlists.jsx'
-import History from './components/History.jsx'
-import Search from './components/Search.jsx'
 import Queue from './components/Queue.jsx'
-import Bucket from './components/Bucket.jsx'
 import Library from './components/Library.jsx'
 import Settings from './components/Settings.jsx'
 import PlayerBar from './components/PlayerBar.jsx'
+import NowPlayingScreen from './components/NowPlayingScreen.jsx'
 
-const TABS = [
-  'search',
-  'now-playing',
-  'queue',
-  'favorites',
-  'playlists',
-  'history',
-  'bucket',
-  'library',
-  'settings',
-]
+// Library is the one-stop hub for finding, selecting, and managing all
+// media (tracks/albums/artists/playlists/favorites/recent/search/add — see
+// Library.jsx); Queue stays separate since live playback ordering is a
+// genuinely distinct, frequently-used job. Both live as header tabs, top
+// and center, rather than the old bottom icon bar — the header has more
+// room to spare than the footer does once Settings (below) is no longer
+// competing with them for a slot there. Settings itself isn't a tab
+// anymore: it's opened via a cog icon at the top right into a full-screen
+// Modal, since it's a config/admin screen you visit occasionally, not a
+// primary destination that deserves equal billing with Library/Queue in
+// the main nav — freeing that slot is what made top-middle tabs fit at
+// all.
+const TABS = ['library', 'queue']
 
 function App() {
-  const { status, downloads, ready, error } = useDaemonSocket()
-  const [tab, setTab] = useHashTab(TABS, 'now-playing')
+  const { status, downloads, jobs, ready, error } = useDaemonSocket()
+  const runningJobs = jobs.filter((j) => j.status === 'running')
+  const [tab, setTab] = useHashTab(TABS, 'library')
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [nowPlayingOpen, setNowPlayingOpen] = useState(false)
 
   // Don't render the real UI until the WebSocket has delivered current
   // state: this is what makes a reload while something's playing seamless
@@ -53,87 +66,107 @@ function App() {
   }
 
   return (
-    <AppShell header={{ height: 60 }} footer={{ height: 88 }} padding="md">
-      <AppShell.Header>
-        <Container h="100%" display="flex" style={{ alignItems: 'center', gap: 12 }}>
-          <Title order={3}>pi-streamer</Title>
-          {downloads.length > 0 && (
-            <Badge
-              variant="light"
-              color="teal"
-              leftSection={<IconDownload size={12} />}
-              title={downloads.map((d) => d.url).join('\n')}
-            >
-              Caching {downloads.length}
-            </Badge>
-          )}
-        </Container>
-      </AppShell.Header>
-
-      <AppShell.Main>
-        <Container size="sm">
-          {/* keepMounted=false: Mantine otherwise renders every tab's panel
-              (and keeps it mounted, effects/polling and all) at once, so
-              switching tabs never unmounts anything — on a low-power
-              mobile browser that's 9 components' worth of intervals/
-              WebSockets and re-renders running concurrently forever. Only
-              the active tab's panel exists now; the others tear down. */}
-          <Tabs value={tab} onChange={setTab} keepMounted={false}>
+    // Tabs wraps AppShell.Main (the Tabs.Panels) and the header's Tabs.List
+    // — Mantine's Tabs is just a controlled context provider, so List/Panel
+    // don't need to be adjacent in the tree, only descendants of the same
+    // Tabs.
+    <Tabs value={tab} onChange={setTab} keepMounted={false}>
+      <AppShell header={{ height: 60 }} footer={{ height: 80 }} padding="md">
+        <AppShell.Header>
+          {/* Three flex sections of equal flex:1 (left spacer, right
+              badges+cog) center the Tabs.List between them regardless of
+              how wide either side's actual content is — that's what makes
+              this "top middle" rather than just left-aligned next to
+              whatever happens to be on the left. */}
+          <Group h="100%" px="md" wrap="nowrap" gap="xs">
+            <div style={{ flex: 1 }} />
             <Tabs.List>
-              <Tabs.Tab value="search" leftSection={<IconSearch size={16} />}>
-                Search
-              </Tabs.Tab>
-              <Tabs.Tab value="now-playing">Now Playing</Tabs.Tab>
-              <Tabs.Tab value="queue">Queue</Tabs.Tab>
-              <Tabs.Tab value="favorites">Favorites</Tabs.Tab>
-              <Tabs.Tab value="playlists">Playlists</Tabs.Tab>
-              <Tabs.Tab value="history">History</Tabs.Tab>
-              <Tabs.Tab value="bucket" leftSection={<IconDatabase size={16} />}>
-                Bucket
-              </Tabs.Tab>
               <Tabs.Tab value="library" leftSection={<IconBooks size={16} />}>
                 Library
               </Tabs.Tab>
-              <Tabs.Tab value="settings" leftSection={<IconSettings size={16} />}>
-                Settings
+              <Tabs.Tab value="queue" leftSection={<IconPlaylist size={16} />}>
+                Queue
               </Tabs.Tab>
             </Tabs.List>
+            <Group style={{ flex: 1 }} justify="flex-end" gap="xs" wrap="nowrap">
+              {downloads.length > 0 && (
+                <Badge
+                  variant="light"
+                  color="teal"
+                  leftSection={<IconDownload size={12} />}
+                  title={downloads.map((d) => d.url).join('\n')}
+                >
+                  Caching {downloads.length}
+                </Badge>
+              )}
+              {runningJobs.length > 0 && (
+                <Badge
+                  variant="light"
+                  color="grape"
+                  leftSection={<IconLoader2 size={12} />}
+                  title={runningJobs.map((j) => j.name).join('\n')}
+                >
+                  {runningJobs.length === 1 ? runningJobs[0].name : `${runningJobs.length} jobs running`}
+                </Badge>
+              )}
+              <ActionIcon
+                variant="subtle"
+                size="lg"
+                onClick={() => setSettingsOpen(true)}
+                aria-label="Settings"
+              >
+                <IconSettings size={20} />
+              </ActionIcon>
+            </Group>
+          </Group>
+        </AppShell.Header>
 
-            <Tabs.Panel value="search" pt="md">
-              <Search />
-            </Tabs.Panel>
-            <Tabs.Panel value="now-playing" pt="md">
-              <NowPlaying status={status} />
+        <AppShell.Main>
+          <Container size="sm">
+            {/* keepMounted=false: Mantine otherwise renders every tab's
+                panel (and keeps it mounted, effects/polling and all) at
+                once, so switching tabs never unmounts anything — on a
+                low-power mobile browser that's every tab's worth of
+                intervals/WebSockets and re-renders running concurrently
+                forever. Only the active tab's panel exists now; the
+                others tear down. */}
+            <Tabs.Panel value="library" pt="md">
+              <Library status={status} />
             </Tabs.Panel>
             <Tabs.Panel value="queue" pt="md">
               <Queue status={status} />
             </Tabs.Panel>
-            <Tabs.Panel value="favorites" pt="md">
-              <Favorites />
-            </Tabs.Panel>
-            <Tabs.Panel value="playlists" pt="md">
-              <Playlists />
-            </Tabs.Panel>
-            <Tabs.Panel value="history" pt="md">
-              <History />
-            </Tabs.Panel>
-            <Tabs.Panel value="bucket" pt="md">
-              <Bucket downloads={downloads} />
-            </Tabs.Panel>
-            <Tabs.Panel value="library" pt="md">
-              <Library />
-            </Tabs.Panel>
-            <Tabs.Panel value="settings" pt="md">
-              <Settings />
-            </Tabs.Panel>
-          </Tabs>
-        </Container>
-      </AppShell.Main>
+          </Container>
+        </AppShell.Main>
 
-      <AppShell.Footer>
-        <PlayerBar status={status} />
-      </AppShell.Footer>
-    </AppShell>
+        <AppShell.Footer>
+          <PlayerBar status={status} onExpand={() => setNowPlayingOpen(true)} />
+        </AppShell.Footer>
+      </AppShell>
+
+      <Modal
+        opened={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        title="Settings"
+        fullScreen
+        transitionProps={{ transition: 'slide-left' }}
+      >
+        <Settings downloads={downloads} jobs={jobs} />
+      </Modal>
+
+      {/* No title/close-button chrome — NowPlayingScreen provides its own
+          back affordance (a chevron at the top), for an immersive
+          full-screen look rather than a generic modal dialog. */}
+      <Modal
+        opened={nowPlayingOpen}
+        onClose={() => setNowPlayingOpen(false)}
+        fullScreen
+        withCloseButton={false}
+        transitionProps={{ transition: 'slide-up' }}
+      >
+        <NowPlayingScreen status={status} onClose={() => setNowPlayingOpen(false)} />
+      </Modal>
+    </Tabs>
   )
 }
 

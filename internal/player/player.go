@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"pi-streamer/internal/indexer"
@@ -34,6 +35,8 @@ type Indexer interface {
 	// duplicate work (re-indexing over a good existing title, or
 	// re-fetching metadata for a track that's already fully tagged).
 	Get(url string) (indexer.Result, bool, error)
+	// Delete removes url from the index — used by RemoveFromLibrary.
+	Delete(url string) error
 }
 
 // MetadataFetcher extracts real title/artist/album tags directly from a
@@ -106,6 +109,15 @@ type Player struct {
 	resolver Resolver
 	archiver FavoriteArchiver
 	metadata MetadataFetcher
+
+	// statusEnrichment caches the search index's answer for the currently
+	// playing URL, so Status (polled once a second while playing, per
+	// cmd/pi-streamer's ticker) doesn't make a fresh indexer.Get call on
+	// every single tick — see enrichStatus's doc comment.
+	statusMu       sync.Mutex
+	statusURL      string
+	statusResult   indexer.Result
+	statusResolved bool
 }
 
 // New returns a Player driving mpd through mpd and persisting state via st.
@@ -132,8 +144,23 @@ func normalizeURL(url string) (string, error) {
 
 // index best-effort submits url/title to the search indexer, if one is
 // configured, and kicks off async metadata enrichment for brand-new URLs.
-// Failures are ignored: indexing is a nice-to-have, not a correctness
-// requirement for playback/favorites/playlists.
+// Runs entirely in the background (its own goroutine) — indexing is a
+// nice-to-have, not a correctness requirement for playback/favorites/
+// playlists, and PlayURL/AddToQueue/AddFavorite/AddToPlaylist must not
+// block their caller (and delay the moment playback actually starts) on
+// however long the search-indexer service takes to respond, especially
+// since checking for an existing entry (below) means a brand-new URL now
+// costs *two* sequential network round-trips, not one.
+func (p *Player) index(url, title string) {
+	if p.indexer == nil {
+		return
+	}
+	go p.indexAsync(url, title)
+}
+
+// indexAsync does the actual work described in index's doc comment. Runs
+// in its own goroutine with its own panic recovery, since nothing else in
+// the call chain would catch one here.
 //
 // If url is already indexed, its existing entry is reused rather than
 // clobbered: a thin add-time call (empty title, as from PlayURL/AddToQueue)
@@ -141,10 +168,12 @@ func normalizeURL(url string) (string, error) {
 // redundant metadata fetch is kicked off for a URL that's already fully
 // tagged — this is what makes adding the same URL twice (e.g. playing a
 // favorite again) a no-op instead of duplicate network work.
-func (p *Player) index(url, title string) {
-	if p.indexer == nil {
-		return
-	}
+func (p *Player) indexAsync(url, title string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in indexing for %s: %v\n%s", url, r, debug.Stack())
+		}
+	}()
 
 	existing, ok, err := p.indexer.Get(url)
 	if err == nil && ok {
@@ -213,8 +242,15 @@ func (p *Player) unresolve(uri string) string {
 	return p.resolver.Unresolve(uri)
 }
 
-// PlayURL adds url to the mpd playlist, starts playback, and records the
-// play in history.
+// PlayURL adds url to the mpd queue, moves it to the front, and jumps
+// playback to it immediately — whatever was already playing stops and this
+// track starts right away, rather than just being appended behind it. Uses
+// mpd's own addid+moveid+playid rather than add+play: add+play (still used
+// by AddToQueue, which deliberately does NOT want this jump-to behavior)
+// only ever resumes/starts mpd's existing "current song" pointer, which is
+// wherever the queue already was, not the URL just appended to the end of
+// it — playid is mpd's actual "play this one now" primitive, and it's what
+// makes the switch instant rather than needing an explicit Stop() first.
 func (p *Player) PlayURL(url string) error {
 	url, err := normalizeURL(url)
 	if err != nil {
@@ -224,10 +260,14 @@ func (p *Player) PlayURL(url string) error {
 	if err != nil {
 		return err
 	}
-	if err := p.mpd.Add(playURI); err != nil {
+	id, err := p.mpd.AddGetID(playURI)
+	if err != nil {
 		return err
 	}
-	if err := p.mpd.Play(); err != nil {
+	if err := p.mpd.MoveInQueue(id, 0); err != nil {
+		return err
+	}
+	if err := p.mpd.PlayQueueItem(id); err != nil {
 		return err
 	}
 	if err := p.store.AddHistory(store.Track{URL: url, PlayedAt: time.Now()}); err != nil {
@@ -293,6 +333,52 @@ func (p *Player) Library(limit, offset int) ([]indexer.Result, error) {
 	return p.indexer.List(limit, offset)
 }
 
+// AddToLibrary upserts url into the search index with the given title,
+// artist, album, and tags — a synchronous, user-initiated add/edit action
+// (distinct from index/indexAsync's fire-and-forget best-effort path used
+// by PlayURL/AddToQueue/AddFavorite/AddToPlaylist). If title, artist, and
+// album are all empty and a MetadataFetcher is configured, it tries a
+// synchronous metadata fetch first (bounded by MetadataFetcher's own
+// timeout) so the entry shows up correctly tagged immediately instead of
+// blank — blocking here is fine, unlike in PlayURL, because the caller of
+// this method is deliberately waiting on it to complete. Returns an error
+// if no indexer is configured, same as Search/Library.
+func (p *Player) AddToLibrary(url, title, artist, album, tags string) error {
+	if p.indexer == nil {
+		return errors.New("player: search indexer not configured")
+	}
+	url, err := normalizeURL(url)
+	if err != nil {
+		return err
+	}
+	if title == "" && artist == "" && album == "" && p.metadata != nil {
+		if fTitle, fArtist, fAlbum, ok := p.metadata.Fetch(url); ok {
+			title, artist, album = fTitle, fArtist, fAlbum
+		}
+	}
+	if err := p.indexer.IndexURL(url, title, artist, album, tags); err != nil {
+		return err
+	}
+	p.invalidateStatusEnrichment(url)
+	return nil
+}
+
+// RemoveFromLibrary deletes url from the search index only — it does not
+// touch Favorites/History/Queue/Bucket, which are intentionally separate
+// stores. If the same URL is played/favorited again later, it's simply
+// re-indexed via IndexURL's existing upsert behavior. Returns an error if
+// no indexer is configured, same as Search/Library.
+func (p *Player) RemoveFromLibrary(url string) error {
+	if p.indexer == nil {
+		return errors.New("player: search indexer not configured")
+	}
+	url, err := normalizeURL(url)
+	if err != nil {
+		return err
+	}
+	return p.indexer.Delete(url)
+}
+
 // Pause pauses playback.
 func (p *Player) Pause() error {
 	return p.mpd.Pause()
@@ -303,21 +389,116 @@ func (p *Player) Resume() error {
 	return p.mpd.Play()
 }
 
-// Status returns the current mpd playback status. If mpd has no Title tag
-// for the current track, Title is filled in with a readable name derived
-// from the URL (see deriveTitleFromURL) rather than left blank — Song is
-// mpdclient's own Title-or-file value, so it's a reasonable source either
-// way (already a real title, or the bare URL to derive from).
+// Status returns the current mpd playback status, with Title/Artist/Album
+// enriched from the search index (see enrichStatus) so a user-edited entry
+// (Player.AddToLibrary) is reflected everywhere "now playing" is shown —
+// the web UI, and the OLED display — not just mpd's own embedded file
+// tags, which AddToLibrary never touches. If, even after that, there's
+// still no Title, one is filled in with a readable name derived from the
+// URL (see deriveTitleFromURL) rather than left blank.
 func (p *Player) Status() (mpdclient.Status, error) {
 	status, err := p.mpd.Status()
 	if err != nil {
 		return status, err
 	}
 	status.Song = p.unresolve(status.Song)
+	status = p.enrichStatus(status)
 	if status.Title == "" && status.Song != "" {
 		status.Title = deriveTitleFromURL(status.Song)
 	}
 	return status, nil
+}
+
+// enrichStatus overrides status.Title/Artist/Album with the search index's
+// values for status.Song, if the index has a non-empty value for that
+// field — a deliberate user edit (AddToLibrary) should win over whatever's
+// embedded in the file itself, which is all mpd's own Status/CurrentSong
+// can ever report, and which AddToLibrary only ever updates in the index,
+// never in the file.
+//
+// This does NOT call Indexer.Get on every invocation, even though Status
+// itself is polled once a second while playing (cmd/pi-streamer's ticker):
+// that would gate the status ticker's throughput on the search-indexer
+// service's own latency/availability on every single tick — exactly the
+// class of bug already fixed once for the play-time indexing path (see
+// indexAsync's doc comment) reintroduced for the status path instead. A
+// fresh lookup only ever happens when status.Song actually changes (a new
+// track started), and even then happens in its own goroutine so it can
+// never block Status itself — until it resolves, Status keeps returning
+// mpd's own tag data for that track unchanged, then picks up the enriched
+// values on a later call once the goroutine finishes (typically well
+// under the 1s tick interval for a healthy indexer; worst case, degrades
+// no worse than "the file's own tags show for a moment," never a stall).
+func (p *Player) enrichStatus(status mpdclient.Status) mpdclient.Status {
+	if p.indexer == nil || status.Song == "" {
+		return status
+	}
+
+	p.statusMu.Lock()
+	if p.statusURL != status.Song {
+		p.statusURL = status.Song
+		p.statusResult = indexer.Result{}
+		p.statusResolved = false
+		p.statusMu.Unlock()
+		go p.refreshStatusEnrichment(status.Song)
+		return status
+	}
+	result, resolved := p.statusResult, p.statusResolved
+	p.statusMu.Unlock()
+
+	if !resolved {
+		return status
+	}
+	if result.Title != "" {
+		status.Title = result.Title
+	}
+	if result.Artist != "" {
+		status.Artist = result.Artist
+	}
+	if result.Album != "" {
+		status.Album = result.Album
+	}
+	return status
+}
+
+// refreshStatusEnrichment looks url up in the search index and caches the
+// answer for enrichStatus, unless the currently playing URL has already
+// moved on to something else by the time this goroutine runs.
+func (p *Player) refreshStatusEnrichment(url string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in status enrichment: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	result, ok, err := p.indexer.Get(url)
+	if err != nil || !ok {
+		return
+	}
+
+	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
+	if p.statusURL == url {
+		p.statusResult = result
+		p.statusResolved = true
+	}
+}
+
+// invalidateStatusEnrichment forces a fresh index lookup for url on its
+// next Status() call, if url happens to be the currently cached/playing
+// song. Needed because enrichStatus's cache otherwise only ever refreshes
+// when the *song* changes — editing a track's metadata (AddToLibrary)
+// while that exact track is already playing doesn't change status.Song at
+// all, so without this, an edit made mid-playback would never show up
+// until the next track started, which is exactly the bug this whole
+// enrichment mechanism was built to fix in the first place.
+func (p *Player) invalidateStatusEnrichment(url string) {
+	p.statusMu.Lock()
+	playing := p.statusURL == url
+	p.statusMu.Unlock()
+	if playing {
+		go p.refreshStatusEnrichment(url)
+	}
 }
 
 // AddFavorite marks url (with an optional title) as a favorite, and

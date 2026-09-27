@@ -13,23 +13,24 @@ import { connectStatusSocket } from '../api.js'
 const BASE_RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
 
-// Single source of truth for everything the daemon pushes over /ws:
-// live playback status AND bucket-download progress, multiplexed onto one
-// connection as {type, data} envelopes (see cmd/pi-streamer/main.go's
-// wsMessage) so a low-power/mobile browser only ever holds open one
-// WebSocket and one 1s status-ticker's worth of traffic, not a socket plus
-// a separate HTTP-polling loop for downloads. Waits for the first "status"
-// message before reporting ready=true — the daemon sends current state
-// immediately on connect (see internal/ws.Hub's `initials`), so a
+// Single source of truth for everything the daemon pushes over /ws: live
+// playback status, bucket-download progress, AND background-job progress
+// (e.g. warming the album art cache), multiplexed onto one connection as
+// {type, data} envelopes (see cmd/pi-streamer/main.go's wsMessage) so a
+// low-power/mobile browser only ever holds open one WebSocket, not a
+// socket plus separate HTTP-polling loops for each. Waits for the first
+// "status" message before reporting ready=true — the daemon sends current
+// state immediately on connect (see internal/ws.Hub's `initials`), so a
 // reloading UI never has to show stale/default state while catching up: it
 // simply doesn't render the real UI until it already has correct data.
 //
 // Call this once at the top of the tree (App.jsx) and pass status/
-// downloads/ready down, so only one WebSocket connection exists per tab
-// regardless of how many components need this state.
+// downloads/jobs/ready down, so only one WebSocket connection exists per
+// tab regardless of how many components need this state.
 export function useDaemonSocket() {
   const [status, setStatus] = useState(null)
   const [downloads, setDownloads] = useState([])
+  const [jobs, setJobs] = useState([])
   const [ready, setReady] = useState(false)
   const [error, setError] = useState(null)
 
@@ -64,6 +65,8 @@ export function useDaemonSocket() {
           setError(null)
         } else if (envelope.type === 'downloads') {
           setDownloads(envelope.data ?? [])
+        } else if (envelope.type === 'jobs') {
+          setJobs(envelope.data ?? [])
         }
       })
 
@@ -114,5 +117,5 @@ export function useDaemonSocket() {
     }
   }, [])
 
-  return { status, downloads, ready, error }
+  return { status, downloads, jobs, ready, error }
 }

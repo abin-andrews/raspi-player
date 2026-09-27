@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
 import { ActionIcon, Group, Slider, Stack, Text, ThemeIcon } from '@mantine/core'
 import {
+  IconChevronUp,
   IconMusic,
   IconPlayerPause,
   IconPlayerPlay,
@@ -12,115 +12,49 @@ import {
   IconVolumeOff,
 } from '@tabler/icons-react'
 import { formatTime } from '../format.js'
-import {
-  albumArtUrl,
-  next,
-  pause,
-  previous,
-  resume,
-  seek,
-  seekRelative,
-  setVolume,
-} from '../api.js'
+import { albumArtUrl } from '../api.js'
+import { usePlayerControls } from '../hooks/usePlayerControls.js'
 
 const ART_SIZE = 48
 
-function PlayerBar({ status }) {
-  const [artFailed, setArtFailed] = useState(false)
-  const [dragValue, setDragValue] = useState(null)
-  const [dragVolume, setDragVolume] = useState(null)
-  const lastNonZeroVolumeRef = useRef(100)
-
-  useEffect(() => {
-    setArtFailed(false)
-  }, [status?.song])
-
-  useEffect(() => {
-    if (status?.volume > 0) {
-      lastNonZeroVolumeRef.current = status.volume
-    }
-  }, [status?.volume])
-
-  const hasSong = Boolean(status?.song)
-  const showArt = hasSong && !artFailed
-  const duration = status?.duration ?? 0
-  const canSeek = duration > 0
-  const elapsed = dragValue !== null ? dragValue : (status?.elapsed ?? 0)
-  const isPlaying = status?.state === 'play'
-  const volume = status?.volume ?? 0
-  const primaryLine = status?.title || status?.song || 'Nothing playing'
-
-  async function handlePlayPause() {
-    try {
-      if (isPlaying) {
-        await pause()
-      } else {
-        await resume()
-      }
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async function handlePrevious() {
-    try {
-      await previous()
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async function handleNext() {
-    try {
-      await next()
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async function handleSeekRelative(delta) {
-    try {
-      await seekRelative(delta)
-    } catch (err) {
-      console.error(err)
-    }
-  }
-
-  async function handleSeekEnd(value) {
-    try {
-      await seek(value)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setDragValue(null)
-    }
-  }
-
-  async function handleVolumeChangeEnd(value) {
-    try {
-      await setVolume(value)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setDragVolume(null)
-    }
-  }
-
-  async function handleMuteToggle() {
-    try {
-      if (volume > 0) {
-        await setVolume(0)
-      } else {
-        await setVolume(lastNonZeroVolumeRef.current || 100)
-      }
-    } catch (err) {
-      console.error(err)
-    }
-  }
+// The persistent mini player, shown on every screen. Clicking the
+// art/title area (not the transport buttons themselves) opens the
+// full-screen NowPlayingScreen for the bigger view — onExpand is optional
+// so this component still renders standalone if a caller has no use for
+// that (there's no other caller today, but nothing here should require
+// it).
+function PlayerBar({ status, onExpand }) {
+  const {
+    showArt,
+    setArtFailed,
+    duration,
+    canSeek,
+    elapsed,
+    isPlaying,
+    volume,
+    primaryLine,
+    setDragValue,
+    dragVolume,
+    setDragVolume,
+    handlePlayPause,
+    handlePrevious,
+    handleNext,
+    handleSeekRelative,
+    handleSeekEnd,
+    handleVolumeChangeEnd,
+    handleMuteToggle,
+  } = usePlayerControls(status)
 
   return (
     <Group justify="space-between" wrap="nowrap" h="100%" px="md">
-      <Group wrap="nowrap" gap="sm" style={{ minWidth: 0, flex: '0 1 240px' }}>
+      <Group
+        wrap="nowrap"
+        gap="sm"
+        style={{ minWidth: 0, flex: '0 1 240px', cursor: onExpand ? 'pointer' : undefined }}
+        onClick={onExpand}
+        role={onExpand ? 'button' : undefined}
+        aria-label={onExpand ? 'Open now playing' : undefined}
+      >
         {showArt ? (
           <img
             src={albumArtUrl(status.song)}
@@ -155,6 +89,11 @@ function PlayerBar({ status }) {
             </Text>
           )}
         </Stack>
+        {onExpand && (
+          <ActionIcon variant="subtle" color="gray" size="sm" style={{ flexShrink: 0 }} tabIndex={-1}>
+            <IconChevronUp size={14} />
+          </ActionIcon>
+        )}
       </Group>
 
       <Stack gap={4} align="center" style={{ flex: '1 1 auto', maxWidth: 480 }}>

@@ -149,6 +149,32 @@ func (c *Client) Get(urlStr string) (Result, bool, error) {
 	return result, true, nil
 }
 
+// Delete DELETEs the search-indexer service's /index endpoint for the
+// exact url. It returns a descriptive error if the request fails or the
+// response status is not 2xx; deleting a url that was never indexed is not
+// treated as an error (mirrors search.Index.Delete).
+func (c *Client) Delete(urlStr string) error {
+	values := url.Values{}
+	values.Set("url", urlStr)
+
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+"/index?"+values.Encode(), nil)
+	if err != nil {
+		return fmt.Errorf("indexer: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("indexer: DELETE /index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("indexer: DELETE /index: status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 // List GETs the search-indexer service's /list endpoint — every indexed
 // entry, most-recently-indexed first, no query needed (the "media
 // library" view, as opposed to Search's query-driven lookup). Zero-valued

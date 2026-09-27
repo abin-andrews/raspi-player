@@ -273,16 +273,99 @@ func handleSeekRelative(p Player) http.HandlerFunc {
 	}
 }
 
-func handleAlbumArt(p Player) http.HandlerFunc {
+// handleAlbumArt resolves url's art (fetching+persisting to disk on first
+// request, see Art) and redirects to the static path it's served from —
+// this handler itself never holds or writes image bytes; that all happens
+// behind Art.Resolve (cmd/pi-streamer's artAdapter + internal/artstore).
+// A confirmed "no art" result 404s directly rather than redirecting
+// anywhere.
+func handleAlbumArt(art Art) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		url := r.URL.Query().Get("url")
-		data, err := p.AlbumArt(url)
-		if err != nil || len(data) == 0 {
+		artist := r.URL.Query().Get("artist")
+		album := r.URL.Query().Get("album")
+
+		path, ok, err := art.Resolve(url, artist, album)
+		if err != nil || !ok {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", http.DetectContentType(data))
-		w.Write(data)
+
+		// Art for a given URL practically never changes once tagged, so
+		// browsers can cache this redirect aggressively — this is what
+		// stops the same track's art from round-tripping through this
+		// handler at all (let alone mpd) on repeat requests; the static
+		// path itself is served by a plain http.FileServer.
+		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+		http.Redirect(w, r, path, http.StatusFound)
+	}
+}
+
+// handleRefreshAlbumArt bypasses whatever's already known and always
+// re-resolves — e.g. a file was re-tagged with new art since it was last
+// resolved, or a MusicBrainz fallback should be retried now that it's
+// configured. Unlike handleAlbumArt, this never redirects — it reports
+// the outcome as JSON so the frontend can react (e.g. re-render the art)
+// without a second round trip.
+func handleRefreshAlbumArt(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL    string `json:"url"`
+			Artist string `json:"artist"`
+			Album  string `json:"album"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		path, ok, err := art.Refresh(req.URL, req.Artist, req.Album)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, ArtStatus{HasArt: ok, Path: path})
+	}
+}
+
+// handleAlbumArtQuery reports, for each of the submitted urls, what's
+// already known — never fetching anything — so the frontend can decide up
+// front whether to request the static path directly, or go straight to a
+// client-generated placeholder, instead of always trying an image and
+// reacting to onError. A url this has no answer for yet (never resolved)
+// is simply omitted from the response map.
+func handleAlbumArtQuery(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URLs []string `json:"urls"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, art.Query(req.URLs))
+	}
+}
+
+// handleWarmAlbumArt kicks off a background scan of the whole library,
+// resolving art for every entry not already known — an explicit "initiate"
+// action so a user can pre-warm the cache (e.g. right after adding a batch
+// of new tracks) rather than only discovering art lazily, one track at a
+// time, as each is first viewed. Returns immediately.
+func handleWarmAlbumArt(art Art) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		art.Warm()
+		writeJSON(w, http.StatusAccepted, nil)
+	}
+}
+
+// handleListJobs reports every currently-tracked background job (running
+// or recently finished) — the frontend normally gets this pushed over
+// /ws instead (see main.go's wsMessage, mirroring how bucket-download
+// progress is pushed rather than polled), but this stays available for a
+// one-off check, same as GET /api/bucket/downloads.
+func handleListJobs(j Jobs) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, j.List())
 	}
 }
 
@@ -414,6 +497,38 @@ func handleLibrary(p Player) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, results)
+	}
+}
+
+func handleAddToLibrary(p Player) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL    string `json:"url"`
+			Title  string `json:"title"`
+			Artist string `json:"artist"`
+			Album  string `json:"album"`
+			Tags   string `json:"tags"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := p.AddToLibrary(req.URL, req.Title, req.Artist, req.Album, req.Tags); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, nil)
+	}
+}
+
+func handleRemoveFromLibrary(p Player) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		url := r.URL.Query().Get("url")
+		if err := p.RemoveFromLibrary(url); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusNoContent, nil)
 	}
 }
 

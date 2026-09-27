@@ -1,17 +1,20 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import {
   Alert,
   Badge,
   Button,
+  Divider,
   Group,
   NumberInput,
   Progress,
+  SegmentedControl,
   Select,
   Stack,
   Text,
   Title,
 } from '@mantine/core'
-import { IconRefresh } from '@tabler/icons-react'
+import { notifications } from '@mantine/notifications'
+import { IconLayoutGrid, IconList, IconPhoto, IconRefresh } from '@tabler/icons-react'
 import {
   getBucketStatus,
   getConfig,
@@ -20,8 +23,11 @@ import {
   getOledStatus,
   reloadConfig,
   setConfig,
+  warmAlbumArt,
 } from '../api.js'
 import { formatBytes } from '../format.js'
+import { useLocalStorageState } from '../hooks/useLocalStorageState.js'
+import Bucket from './Bucket.jsx'
 
 const DEFAULT_BAUD = 115200
 const MODE_DATA = [
@@ -40,7 +46,13 @@ const MODE_DATA = [
 // text — the backend rejects anything else anyway (internal/api's
 // validateOLED/validateBucket), so offering only valid choices avoids a
 // round-trip just to find out a typed value was rejected.
-function Settings() {
+function Settings({ downloads = [], jobs = [] }) {
+  // Same key/hook Library.jsx's own grid/list toggle uses — this control
+  // and that one are two entry points to the one persisted preference, not
+  // separate settings: switching it here changes what Library starts on
+  // next time, and switching it in Library updates what shows here too.
+  const [libraryViewMode, setLibraryViewMode] = useLocalStorageState('library.viewMode', 'list')
+
   const [port, setPort] = useState('')
   const [baud, setBaud] = useState(String(DEFAULT_BAUD))
   const [ports, setPorts] = useState([])
@@ -56,6 +68,7 @@ function Settings() {
 
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(false)
+  const [warmingArt, setWarmingArt] = useState(false)
   const [error, setError] = useState(null)
 
   async function refreshOledStatus() {
@@ -145,6 +158,25 @@ function Settings() {
     }
   }
 
+  const artJob = jobs.find((j) => j.name === 'Warm album art cache' && j.status === 'running')
+
+  async function handleWarmArt() {
+    setError(null)
+    setWarmingArt(true)
+    try {
+      await warmAlbumArt()
+      notifications.show({
+        color: 'green',
+        title: 'Album art warming started',
+        message: "Running in the background — art will appear as it's found.",
+      })
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setWarmingArt(false)
+    }
+  }
+
   const portData = [
     { value: '', label: 'Disabled (no display)' },
     ...ports.map((p) => ({ value: p, label: p })),
@@ -159,6 +191,39 @@ function Settings() {
         </Alert>
       )}
 
+      <Title order={5}>Library</Title>
+      <Text size="sm" c="dimmed">
+        Default view for the Library tab's Tracks/Albums/Artists lists — grid shows album art
+        tiles, list is more compact. Applies immediately (this device only) and is remembered for
+        next time, whether you change it here or with the toggle in Library itself.
+      </Text>
+      <SegmentedControl
+        value={libraryViewMode}
+        onChange={setLibraryViewMode}
+        style={{ alignSelf: 'flex-start' }}
+        data={[
+          {
+            value: 'list',
+            label: (
+              <Group gap={4} wrap="nowrap">
+                <IconList size={14} />
+                <span>List</span>
+              </Group>
+            ),
+          },
+          {
+            value: 'grid',
+            label: (
+              <Group gap={4} wrap="nowrap">
+                <IconLayoutGrid size={14} />
+                <span>Grid</span>
+              </Group>
+            ),
+          },
+        ]}
+      />
+
+      <Divider mt="md" />
       <Title order={5}>OLED Display</Title>
       <Text size="sm" c="dimmed">
         Drives the Arduino display over USB serial (see arduino/control.ino). Connects
@@ -299,8 +364,47 @@ function Settings() {
           Reload from file
         </Button>
       </Group>
+
+      <Divider mt="md" />
+      <Title order={5}>Album Art</Title>
+      <Text size="sm" c="dimmed">
+        Art is fetched from mpd on first request and cached (both which tracks have real art and
+        the bytes themselves) so it never has to be re-fetched — a track confirmed to have no art
+        (common for internet radio) shows a generated placeholder in the Library's grid view
+        instead of a blank icon. Warming pre-checks every track in the library now, rather than
+        waiting for each to be viewed once first.
+      </Text>
+      <Button
+        variant="light"
+        onClick={handleWarmArt}
+        loading={warmingArt}
+        disabled={Boolean(artJob)}
+        leftSection={<IconPhoto size={16} />}
+        style={{ alignSelf: 'flex-start' }}
+      >
+        {artJob ? 'Warming…' : 'Warm album art cache'}
+      </Button>
+      {artJob && (
+        <Stack gap={4}>
+          <Progress
+            value={artJob.total ? (100 * artJob.done) / artJob.total : 100}
+            size="sm"
+            animated={!artJob.total}
+          />
+          <Text size="xs" c="dimmed">
+            {artJob.total ? `${artJob.done} of ${artJob.total} tracks checked` : 'Scanning the library…'}
+          </Text>
+        </Stack>
+      )}
+
+      <Divider mt="md" />
+      <Bucket downloads={downloads} />
     </Stack>
   )
 }
 
-export default Settings
+// Memoized: only re-renders when `downloads` actually changes (the daemon
+// only pushes a "downloads" message when the snapshot differs from the
+// last one it sent) — not on the once-a-second status ticks that flow
+// through the tree while playing.
+export default memo(Settings)

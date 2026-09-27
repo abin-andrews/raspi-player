@@ -27,6 +27,15 @@ type oledManager struct {
 	port    string
 	baud    int
 	lastErr error
+
+	// lastTitle/lastArtist/lastAlbum/lastState are what updateOLEDTrack most
+	// recently sent to the display, so it can tell whether a given status
+	// actually needs a full redraw or just a cheaper TIME-only update — see
+	// its doc comment.
+	lastTitle  string
+	lastArtist string
+	lastAlbum  string
+	lastState  string
 }
 
 // reconfigure closes any existing connection and opens port/baud instead.
@@ -41,6 +50,13 @@ func (m *oledManager) reconfigure(port string, baud int) {
 	}
 	m.port, m.baud = port, baud
 	m.lastErr = nil
+	// A fresh connection means the sketch's own boot-time placeholder
+	// values are on screen, regardless of what this manager last sent to a
+	// previous connection — clear the cache so updateOLEDTrack's next call
+	// always does a full send rather than potentially (if the track hasn't
+	// changed since the old connection) mistaking this for "nothing to
+	// update."
+	m.lastTitle, m.lastArtist, m.lastAlbum, m.lastState = "", "", "", ""
 	if port == "" {
 		return
 	}
@@ -272,12 +288,45 @@ func truncateOLEDLine(parts []string) []string {
 
 // updateOLEDTrack pushes a full batched update — BEGIN/.../END so the
 // display redraws only once, after every field has landed, instead of
-// flashing an in-between frame.
+// flashing an in-between frame — but only when Title/Artist/Album/State
+// actually changed since the last call; otherwise it sends just the
+// (always-changing-while-playing) TIME field on its own, cheaper than a
+// full redraw every second for no visible reason. m remembers what it last
+// sent (lastTitle/lastArtist/lastAlbum/lastState) so every caller can just
+// call this on every tick/status change without needing to know itself
+// whether anything actually changed.
+//
+// This diffing lives here, not in the caller, specifically because "did
+// the track change" is NOT the same question as "did Title/Artist/Album
+// change": editing a track's metadata via the Library tab
+// (internal/player.Player.AddToLibrary) changes what Status() reports for
+// the *same* currently-playing song, with no mpd-side track/player event
+// at all to signal it — an earlier version had cmd/pi-streamer's 1s status
+// ticker decide "only send TIME" purely from whether SongID changed, which
+// meant an edit applied to the track already playing would update
+// GET /api/status immediately but never reach the physical display, since
+// nothing about "which song" changed, only its metadata. Comparing the
+// actual field values here, unconditionally, reacts correctly regardless
+// of *why* they changed.
 func updateOLEDTrack(m *oledManager, status mpdclient.Status) {
 	title := status.Title
 	if title == "" {
 		title = status.Song
 	}
+
+	m.mu.Lock()
+	changed := title != m.lastTitle || status.Artist != m.lastArtist ||
+		status.Album != m.lastAlbum || status.State != m.lastState
+	if changed {
+		m.lastTitle, m.lastArtist, m.lastAlbum, m.lastState = title, status.Artist, status.Album, status.State
+	}
+	m.mu.Unlock()
+
+	if !changed {
+		m.send("TIME", strconv.Itoa(int(status.Elapsed)))
+		return
+	}
+
 	m.send("BEGIN")
 	m.send("TITLE", oledSanitize(oledTruncate(title, oledTitleMax)))
 	m.send("ARTIST", oledSanitize(oledTruncate(status.Artist, oledTextMax)))
@@ -286,11 +335,4 @@ func updateOLEDTrack(m *oledManager, status mpdclient.Status) {
 	m.send("TIME", strconv.Itoa(int(status.Elapsed)))
 	m.send("STATE", oledState(status.State))
 	m.send("END")
-}
-
-// updateOLEDElapsed pushes just the elapsed-time field, for the once-a-
-// second progress tick where nothing else about the track changed —
-// cheaper than a full BEGIN/END batch for every tick.
-func updateOLEDElapsed(m *oledManager, elapsedSeconds float64) {
-	m.send("TIME", strconv.Itoa(int(elapsedSeconds)))
 }

@@ -22,7 +22,6 @@ type Player interface {
 	Resume() error
 	Status() (mpdclient.Status, error)
 	Seek(seconds float64) error
-	AlbumArt(url string) ([]byte, error)
 	Next() error
 	Previous() error
 	SetVolume(volume int) error
@@ -44,6 +43,12 @@ type Player interface {
 	// the "media library" browsing view (no query needed), as opposed to
 	// Search's query-driven lookup.
 	Library(limit, offset int) ([]indexer.Result, error)
+	// AddToLibrary upserts a library entry (add a new URL, or edit an
+	// existing one by resubmitting the same URL with changed fields).
+	AddToLibrary(url, title, artist, album, tags string) error
+	// RemoveFromLibrary deletes url from the search index only — see
+	// player.Player.RemoveFromLibrary's doc comment.
+	RemoveFromLibrary(url string) error
 
 	Queue() ([]mpdclient.QueueTrack, error)
 	AddToQueue(url string) error
@@ -130,8 +135,71 @@ type BucketDownload struct {
 	TotalBytes int64 `json:"totalBytes"`
 }
 
-// NewRouter builds the HTTP command API, dispatching to p, cfg, o, and b.
-func NewRouter(p Player, cfg Config, o Oled, b Bucket) http.Handler {
+// ArtStatus reports what's known about one track's album art — see Art.
+type ArtStatus struct {
+	HasArt bool `json:"hasArt"`
+	// Path is the static URL to fetch the art from (served by a plain
+	// http.FileServer, mounted outside this package — see
+	// cmd/pi-streamer/main.go — so repeat requests never reach the Go
+	// application at all, not even this router). Empty when HasArt is
+	// false.
+	Path string `json:"path,omitempty"`
+}
+
+// Art is the subset of the daemon's album-art resolution/storage behavior
+// the HTTP API needs. The real implementation (cmd/pi-streamer's
+// artAdapter) fetches art via mpd on first request and persists it to
+// disk (internal/artstore) rather than holding it in the Go process's
+// memory — deliberate, given this runs on a 512MB Raspberry Pi Zero 2 W,
+// where any in-memory image cache is permanent pressure on an already-tiny
+// budget that a disk-backed one plus the OS's own page cache avoids.
+type Art interface {
+	// Resolve returns the static path to serve url's art from, fetching
+	// and persisting it first if url hasn't been checked yet (artist/album
+	// are optional hints used only for a MusicBrainz/Cover Art Archive
+	// fallback lookup when mpd itself has nothing). ok=false means
+	// confirmed no art (the caller should 404, not redirect).
+	Resolve(url, artist, album string) (path string, ok bool, err error)
+	// Refresh is Resolve but bypassing whatever's already known and
+	// always re-resolving — e.g. a file was re-tagged with new art since
+	// it was last resolved.
+	Refresh(url, artist, album string) (path string, ok bool, err error)
+	// Query reports what's already known for each of urls without
+	// fetching anything — see Bucket.Query's identical "one request per
+	// rendered list" reasoning. A url absent from the result is simply
+	// unknown (never resolved yet), not confirmed either way.
+	Query(urls []string) map[string]ArtStatus
+	// Warm kicks off a background scan (tracked as a Job, see Jobs)
+	// pre-resolving art for the whole library, so viewing it for the
+	// first time doesn't have to.
+	Warm()
+}
+
+// Job mirrors internal/jobs.Job's shape at the API layer, the same
+// "own copy, no direct import" pattern as BucketStatus/BucketEntry above —
+// keeps this package decoupled from the concrete job-tracking
+// implementation.
+type Job struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	Total     int       `json:"total,omitempty"`
+	Done      int       `json:"done,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
+	EndedAt   time.Time `json:"endedAt,omitempty"`
+}
+
+// Jobs is the subset of the daemon's long-running-job tracking
+// (internal/jobs.Manager) the HTTP API needs — currently only album art
+// warming uses it, but it's a general mechanism for any future background
+// task that shouldn't be a silent fire-and-forget goroutine.
+type Jobs interface {
+	List() []Job
+}
+
+// NewRouter builds the HTTP command API, dispatching to p, cfg, o, b, art, and j.
+func NewRouter(p Player, cfg Config, o Oled, b Bucket, art Art, j Jobs) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/play", handlePlay(p))
@@ -139,7 +207,11 @@ func NewRouter(p Player, cfg Config, o Oled, b Bucket) http.Handler {
 	mux.HandleFunc("POST /api/resume", handleResume(p))
 	mux.HandleFunc("GET /api/status", handleStatus(p))
 	mux.HandleFunc("POST /api/seek", handleSeek(p))
-	mux.HandleFunc("GET /api/albumart", handleAlbumArt(p))
+	mux.HandleFunc("GET /api/albumart", handleAlbumArt(art))
+	mux.HandleFunc("POST /api/albumart/query", handleAlbumArtQuery(art))
+	mux.HandleFunc("POST /api/albumart/refresh", handleRefreshAlbumArt(art))
+	mux.HandleFunc("POST /api/albumart/warm", handleWarmAlbumArt(art))
+	mux.HandleFunc("GET /api/jobs", handleListJobs(j))
 	mux.HandleFunc("POST /api/next", handleNext(p))
 	mux.HandleFunc("POST /api/previous", handlePrevious(p))
 	mux.HandleFunc("POST /api/volume", handleVolume(p))
@@ -158,6 +230,8 @@ func NewRouter(p Player, cfg Config, o Oled, b Bucket) http.Handler {
 
 	mux.HandleFunc("GET /api/search", handleSearch(p))
 	mux.HandleFunc("GET /api/library", handleLibrary(p))
+	mux.HandleFunc("POST /api/library", handleAddToLibrary(p))
+	mux.HandleFunc("DELETE /api/library", handleRemoveFromLibrary(p))
 
 	mux.HandleFunc("GET /api/queue", handleGetQueue(p))
 	mux.HandleFunc("POST /api/queue", handleAddToQueue(p))

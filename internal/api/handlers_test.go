@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,11 +16,74 @@ import (
 )
 
 // newRouter builds a router with a fakePlayer plus default (unconfigured)
-// fakeConfig/fakeOled/fakeBucket — the tests below that don't care about
-// config/OLED/bucket behavior use this instead of constructing their own
-// fakes.
+// fakeConfig/fakeOled/fakeBucket/fakeArt/fakeJobs — the tests below that
+// don't care about config/OLED/bucket/art/jobs behavior use this instead
+// of constructing their own fakes.
 func newRouter(p Player) http.Handler {
-	return NewRouter(p, newFakeConfig(), newFakeOled(), newFakeBucket())
+	return NewRouter(p, newFakeConfig(), newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
+}
+
+// newRouterWithArt is newRouter but with a caller-supplied fakeArt, for
+// tests that need to control what Resolve/Refresh/Query/Warm do.
+func newRouterWithArt(p Player, art *fakeArt) http.Handler {
+	return NewRouter(p, newFakeConfig(), newFakeOled(), newFakeBucket(), art, newFakeJobs())
+}
+
+// fakeArtResult is one canned Resolve()/Refresh() response for fakeArt.
+type fakeArtResult struct {
+	path string
+	ok   bool
+	err  error
+}
+
+// fakeArt is a minimal in-memory Art implementation for handler tests.
+type fakeArt struct {
+	results      map[string]fakeArtResult
+	resolveCalls []string
+	refreshCalls []string
+
+	queryResult map[string]ArtStatus
+	queryCalls  [][]string
+
+	warmCalled bool
+}
+
+func newFakeArt() *fakeArt {
+	return &fakeArt{results: map[string]fakeArtResult{}}
+}
+
+func (f *fakeArt) Resolve(url, artist, album string) (string, bool, error) {
+	f.resolveCalls = append(f.resolveCalls, url)
+	r := f.results[url]
+	return r.path, r.ok, r.err
+}
+
+func (f *fakeArt) Refresh(url, artist, album string) (string, bool, error) {
+	f.refreshCalls = append(f.refreshCalls, url)
+	r := f.results[url]
+	return r.path, r.ok, r.err
+}
+
+func (f *fakeArt) Query(urls []string) map[string]ArtStatus {
+	f.queryCalls = append(f.queryCalls, urls)
+	return f.queryResult
+}
+
+func (f *fakeArt) Warm() {
+	f.warmCalled = true
+}
+
+// fakeJobs is a minimal in-memory Jobs implementation for handler tests.
+type fakeJobs struct {
+	jobs []Job
+}
+
+func newFakeJobs() *fakeJobs {
+	return &fakeJobs{}
+}
+
+func (f *fakeJobs) List() []Job {
+	return f.jobs
 }
 
 // fakeConfig is a minimal in-memory Config implementation for handler tests.
@@ -109,14 +171,16 @@ type fakePlayer struct {
 	volumeCalls       []int
 	seekRelativeCalls []float64
 
-	art    []byte
-	artErr error
-
 	searchResults []indexer.Result
 	searchErr     error
 
 	libraryResults []indexer.Result
 	libraryErr     error
+
+	addToLibraryCalls []indexer.Result
+	addToLibraryErr   error
+	removeFromLibrary []string
+	removeLibraryErr  error
 
 	queue              []mpdclient.QueueTrack
 	addToQueueCalls    []string
@@ -236,14 +300,30 @@ func (f *fakePlayer) SeekRelative(seconds float64) error {
 	return nil
 }
 
-func (f *fakePlayer) AlbumArt(url string) ([]byte, error) { return f.art, f.artErr }
-
 func (f *fakePlayer) Search(query string, limit int) ([]indexer.Result, error) {
 	return f.searchResults, f.searchErr
 }
 
 func (f *fakePlayer) Library(limit, offset int) ([]indexer.Result, error) {
 	return f.libraryResults, f.libraryErr
+}
+
+func (f *fakePlayer) AddToLibrary(url, title, artist, album, tags string) error {
+	if f.addToLibraryErr != nil {
+		return f.addToLibraryErr
+	}
+	f.addToLibraryCalls = append(f.addToLibraryCalls, indexer.Result{
+		URL: url, Title: title, Artist: artist, Album: album, Tags: tags,
+	})
+	return nil
+}
+
+func (f *fakePlayer) RemoveFromLibrary(url string) error {
+	if f.removeLibraryErr != nil {
+		return f.removeLibraryErr
+	}
+	f.removeFromLibrary = append(f.removeFromLibrary, url)
+	return nil
 }
 
 func (f *fakePlayer) Queue() ([]mpdclient.QueueTrack, error) {
@@ -554,27 +634,162 @@ func TestHandleSeekRelativeBadBody(t *testing.T) {
 	}
 }
 
-func TestHandleAlbumArtFound(t *testing.T) {
+func TestHandleAlbumArtRedirectsWhenResolved(t *testing.T) {
 	p := newFakePlayer()
-	p.art = []byte("fake-jpeg-bytes")
-	h := newRouter(p)
+	art := newFakeArt()
+	art.results["http://example.com/a.mp3"] = fakeArtResult{path: "/art/abc.jpg", ok: true}
+	h := newRouterWithArt(p, art)
 
 	rec := doRequest(t, h, "GET", "/api/albumart?url=http://example.com/a.mp3", "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%s", rec.Code, rec.Body.String())
 	}
-	if !bytes.Equal(rec.Body.Bytes(), p.art) {
-		t.Errorf("body = %v, want %v", rec.Body.Bytes(), p.art)
+	if got := rec.Header().Get("Location"); got != "/art/abc.jpg" {
+		t.Errorf("Location = %q, want %q", got, "/art/abc.jpg")
+	}
+	if got := rec.Header().Get("Cache-Control"); got == "" {
+		t.Error("Cache-Control header missing on a resolved redirect")
 	}
 }
 
-func TestHandleAlbumArtNotFound(t *testing.T) {
+func TestHandleAlbumArtNotFoundWhenConfirmedNoArt(t *testing.T) {
 	p := newFakePlayer()
-	h := newRouter(p)
+	art := newFakeArt()
+	art.results["http://example.com/a.mp3"] = fakeArtResult{ok: false}
+	h := newRouterWithArt(p, art)
 
 	rec := doRequest(t, h, "GET", "/api/albumart?url=http://example.com/a.mp3", "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandleAlbumArtNotFoundOnResolveError(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.results["http://example.com/a.mp3"] = fakeArtResult{err: errors.New("mpd unreachable")}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "GET", "/api/albumart?url=http://example.com/a.mp3", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandleAlbumArtQuery(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.queryResult = map[string]ArtStatus{
+		"http://example.com/has-art.mp3": {HasArt: true, Path: "/art/abc.jpg"},
+		"http://example.com/no-art.mp3":  {HasArt: false},
+	}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/query",
+		`{"urls":["http://example.com/has-art.mp3","http://example.com/no-art.mp3"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got map[string]ArtStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["http://example.com/has-art.mp3"] != (ArtStatus{HasArt: true, Path: "/art/abc.jpg"}) {
+		t.Errorf("has-art.mp3 = %+v, want HasArt=true Path=/art/abc.jpg", got["http://example.com/has-art.mp3"])
+	}
+	if got["http://example.com/no-art.mp3"] != (ArtStatus{HasArt: false}) {
+		t.Errorf("no-art.mp3 = %+v, want HasArt=false", got["http://example.com/no-art.mp3"])
+	}
+	if len(art.queryCalls) != 1 || art.queryCalls[0][0] != "http://example.com/has-art.mp3" {
+		t.Errorf("queryCalls = %v, want the submitted urls passed straight through", art.queryCalls)
+	}
+}
+
+func TestHandleAlbumArtQueryBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/query", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleWarmAlbumArt(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/warm", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if !art.warmCalled {
+		t.Error("Warm() was not called")
+	}
+}
+
+func TestHandleRefreshAlbumArt(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.results["http://example.com/a.mp3"] = fakeArtResult{path: "/art/abc.jpg", ok: true}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/refresh",
+		`{"url":"http://example.com/a.mp3","artist":"Fleetwood Mac","album":"Rumours"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got ArtStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != (ArtStatus{HasArt: true, Path: "/art/abc.jpg"}) {
+		t.Errorf("body = %+v, want HasArt=true Path=/art/abc.jpg", got)
+	}
+	if len(art.refreshCalls) != 1 || art.refreshCalls[0] != "http://example.com/a.mp3" {
+		t.Errorf("refreshCalls = %v, want one entry for the submitted url", art.refreshCalls)
+	}
+}
+
+func TestHandleRefreshAlbumArtBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/refresh", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleRefreshAlbumArtError(t *testing.T) {
+	p := newFakePlayer()
+	art := newFakeArt()
+	art.results["http://example.com/a.mp3"] = fakeArtResult{err: errors.New("mpd unreachable")}
+	h := newRouterWithArt(p, art)
+
+	rec := doRequest(t, h, "POST", "/api/albumart/refresh", `{"url":"http://example.com/a.mp3"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleListJobs(t *testing.T) {
+	p := newFakePlayer()
+	j := newFakeJobs()
+	j.jobs = []Job{{ID: "1", Name: "Warm album art cache", Status: "running", Total: 10, Done: 3}}
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), newFakeBucket(), newFakeArt(), j)
+
+	rec := doRequest(t, h, "GET", "/api/jobs", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got []Job
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 || got[0] != j.jobs[0] {
+		t.Errorf("body = %+v, want %+v", got, j.jobs)
 	}
 }
 
@@ -620,6 +835,66 @@ func TestHandleLibraryError(t *testing.T) {
 	h := newRouter(p)
 
 	rec := doRequest(t, h, "GET", "/api/library", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleAddToLibrary(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/library",
+		`{"url":"http://example.com/a.mp3","title":"A","artist":"Artist","album":"Album","tags":"foo"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(p.addToLibraryCalls) != 1 || p.addToLibraryCalls[0].URL != "http://example.com/a.mp3" ||
+		p.addToLibraryCalls[0].Artist != "Artist" {
+		t.Errorf("addToLibraryCalls = %v, want one entry with the submitted fields", p.addToLibraryCalls)
+	}
+}
+
+func TestHandleAddToLibraryBadBody(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/library", `not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleAddToLibraryError(t *testing.T) {
+	p := newFakePlayer()
+	p.addToLibraryErr = errors.New("indexer unavailable")
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "POST", "/api/library", `{"url":"http://example.com/a.mp3"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestHandleRemoveFromLibrary(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "DELETE", "/api/library?url=http://example.com/a.mp3", "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(p.removeFromLibrary) != 1 || p.removeFromLibrary[0] != "http://example.com/a.mp3" {
+		t.Errorf("removeFromLibrary = %v, want one entry", p.removeFromLibrary)
+	}
+}
+
+func TestHandleRemoveFromLibraryError(t *testing.T) {
+	p := newFakePlayer()
+	p.removeLibraryErr = errors.New("indexer unavailable")
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "DELETE", "/api/library?url=http://example.com/a.mp3", "")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
 	}
@@ -767,7 +1042,7 @@ func TestHandleGetConfig(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM0", Baud: 115200}}
-	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/config", "")
 	if rec.Code != http.StatusOK {
@@ -787,7 +1062,7 @@ func TestHandleSetConfig(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o, newFakeBucket())
+	h := NewRouter(p, cfg, o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusOK {
@@ -802,7 +1077,7 @@ func TestHandleSetConfig(t *testing.T) {
 func TestHandleSetConfigBadBody(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
-	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `not json`)
 	if rec.Code != http.StatusBadRequest {
@@ -816,7 +1091,7 @@ func TestHandleSetConfigError(t *testing.T) {
 	cfg.setErr = errors.New("write failed")
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o, newFakeBucket())
+	h := NewRouter(p, cfg, o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusInternalServerError {
@@ -829,7 +1104,7 @@ func TestHandleSetConfigDisallowedBaud(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0"}
-	h := NewRouter(p, cfg, o, newFakeBucket())
+	h := NewRouter(p, cfg, o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":31337}}`)
 	if rec.Code != http.StatusBadRequest {
@@ -845,7 +1120,7 @@ func TestHandleSetConfigUnavailablePort(t *testing.T) {
 	cfg := newFakeConfig()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyUSB0"} // does not include the requested port
-	h := NewRouter(p, cfg, o, newFakeBucket())
+	h := NewRouter(p, cfg, o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"/dev/ttyACM0","baud":115200}}`)
 	if rec.Code != http.StatusBadRequest {
@@ -860,7 +1135,7 @@ func TestHandleSetConfigEmptyPortSkipsValidation(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	o := newFakeOled() // no ports registered, and no baud given either
-	h := NewRouter(p, cfg, o, newFakeBucket())
+	h := NewRouter(p, cfg, o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config", `{"oled":{"port":"","baud":0}}`)
 	if rec.Code != http.StatusOK {
@@ -898,7 +1173,7 @@ func TestHandleReloadConfig(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.cfg = config.Config{OLED: config.OLED{Port: "/dev/ttyACM1", Baud: 9600}}
-	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "POST", "/api/config/reload", "")
 	if rec.Code != http.StatusOK {
@@ -920,7 +1195,7 @@ func TestHandleReloadConfigError(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
 	cfg.reloadErr = errors.New("read failed")
-	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "POST", "/api/config/reload", "")
 	if rec.Code != http.StatusInternalServerError {
@@ -932,7 +1207,7 @@ func TestHandleOledStatus(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.status = OledStatus{Connected: true, Port: "/dev/ttyACM0", Baud: 115200}
-	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/oled/status", "")
 	if rec.Code != http.StatusOK {
@@ -951,7 +1226,7 @@ func TestHandleOledPorts(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.ports = []string{"/dev/ttyACM0", "/dev/ttyUSB0"}
-	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
 	if rec.Code != http.StatusOK {
@@ -970,7 +1245,7 @@ func TestHandleOledPortsError(t *testing.T) {
 	p := newFakePlayer()
 	o := newFakeOled()
 	o.portsErr = errors.New("enumeration failed")
-	h := NewRouter(p, newFakeConfig(), o, newFakeBucket())
+	h := NewRouter(p, newFakeConfig(), o, newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/oled/ports", "")
 	if rec.Code != http.StatusInternalServerError {
@@ -982,7 +1257,7 @@ func TestHandleBucketStatus(t *testing.T) {
 	p := newFakePlayer()
 	b := newFakeBucket()
 	b.status = BucketStatus{Mode: "bucket", UsedBytes: 100, MaxBytes: 1000}
-	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/bucket/status", "")
 	if rec.Code != http.StatusOK {
@@ -1001,7 +1276,7 @@ func TestHandleBucketQuery(t *testing.T) {
 	p := newFakePlayer()
 	b := newFakeBucket()
 	b.queryResp = map[string]bool{"http://example.com/a.mp3": true, "http://example.com/b.mp3": false}
-	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "POST", "/api/bucket/query",
 		`{"urls":["http://example.com/a.mp3","http://example.com/b.mp3"]}`)
@@ -1035,7 +1310,7 @@ func TestHandleBucketList(t *testing.T) {
 	b := newFakeBucket()
 	when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	b.listResp = []BucketEntry{{URL: "http://example.com/a.mp3", SizeBytes: 1234, LastAccessed: when}}
-	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/bucket/list", "")
 	if rec.Code != http.StatusOK {
@@ -1054,7 +1329,7 @@ func TestHandleBucketListError(t *testing.T) {
 	p := newFakePlayer()
 	b := newFakeBucket()
 	b.listErr = errors.New("list failed")
-	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/bucket/list", "")
 	if rec.Code != http.StatusInternalServerError {
@@ -1068,7 +1343,7 @@ func TestHandleBucketDownloads(t *testing.T) {
 	b.downloadsResp = []BucketDownload{
 		{URL: "http://example.com/a.mp3", ReceivedBytes: 500, TotalBytes: 2000},
 	}
-	h := NewRouter(p, newFakeConfig(), newFakeOled(), b)
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "GET", "/api/bucket/downloads", "")
 	if rec.Code != http.StatusOK {
@@ -1106,7 +1381,7 @@ func TestHandleSetConfigNegativeBucketSize(t *testing.T) {
 func TestHandleSetConfigValidBucketSettings(t *testing.T) {
 	p := newFakePlayer()
 	cfg := newFakeConfig()
-	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket())
+	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config",
 		`{"bucket":{"mode":"bucket","maxSizeMb":1024,"favoritesMaxSizeMb":2048,"minFreeMb":512}}`)

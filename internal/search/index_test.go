@@ -286,6 +286,53 @@ func TestGetReportsNotFoundForAnUnindexedURL(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	idx, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open() error = %v, want nil", err)
+	}
+	defer idx.Close()
+
+	if err := idx.IndexURL("https://example.com/a", "A", "", "", ""); err != nil {
+		t.Fatalf("IndexURL(a) error = %v, want nil", err)
+	}
+	if err := idx.IndexURL("https://example.com/b", "B", "", "", ""); err != nil {
+		t.Fatalf("IndexURL(b) error = %v, want nil", err)
+	}
+
+	if err := idx.Delete("https://example.com/a"); err != nil {
+		t.Fatalf("Delete() error = %v, want nil", err)
+	}
+
+	got, err := idx.List(0, 0)
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(got) != 1 || got[0].URL != "https://example.com/b" {
+		t.Errorf("List() after Delete = %v, want just b", got)
+	}
+
+	_, ok, err := idx.Get("https://example.com/a")
+	if err != nil {
+		t.Fatalf("Get() error = %v, want nil", err)
+	}
+	if ok {
+		t.Error("Get() ok = true, want false for a deleted URL")
+	}
+}
+
+func TestDeleteOfUnindexedURLIsNotAnError(t *testing.T) {
+	idx, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open() error = %v, want nil", err)
+	}
+	defer idx.Close()
+
+	if err := idx.Delete("https://example.com/never-indexed"); err != nil {
+		t.Errorf("Delete() of an unindexed URL: error = %v, want nil", err)
+	}
+}
+
 func TestOpenCreatesTable(t *testing.T) {
 	idx, err := Open(":memory:")
 	if err != nil {

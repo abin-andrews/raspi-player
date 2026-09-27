@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"pi-streamer/internal/api"
+	"pi-streamer/internal/artstore"
 	"pi-streamer/internal/bucket"
 	"pi-streamer/internal/config"
+	"pi-streamer/internal/coverart"
 	"pi-streamer/internal/indexer"
+	"pi-streamer/internal/jobs"
 	"pi-streamer/internal/metadata"
 	"pi-streamer/internal/mpdclient"
 	"pi-streamer/internal/player"
@@ -55,6 +58,8 @@ func main() {
 		"loopback-only address serving cached bucket files to mpd (bucket mode only) — mpd can't be handed a "+
 			"raw filesystem path directly (it only permits that over its own Unix socket, which this daemon "+
 			"doesn't use), so it fetches from here over plain HTTP instead")
+	artDir := flag.String("art-dir", "art-cache",
+		"directory for resolved album art, served back out as static files at /art/ — see internal/artstore")
 	flag.Parse()
 
 	mpdConn, err := mpdclient.Dial("tcp", *mpdAddr)
@@ -80,6 +85,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("open favorites archive at %s: %v", *favoritesDir, err)
 	}
+	artStore, err := artstore.Open(*artDir)
+	if err != nil {
+		log.Fatalf("open art store at %s: %v", *artDir, err)
+	}
 
 	idx := indexer.New(*indexerAddr)
 	resolver := &modeResolver{
@@ -103,11 +112,11 @@ func main() {
 	bucketAPI := &bucketAdapter{cfg: cfgStore, cache: cache, favorites: favorites}
 
 	// wsMessage envelopes every payload multiplexed over the single /ws
-	// connection (status, bucket download progress, ...) so one browser
-	// WebSocket can carry more than one kind of push update — the frontend
-	// dispatches on Type instead of needing a connection per concern.
-	// hub.Broadcast itself is payload-agnostic ([]byte in, []byte out), so
-	// this envelope is purely a main.go/frontend contract.
+	// connection (status, bucket download progress, job progress, ...) so
+	// one browser WebSocket can carry more than one kind of push update —
+	// the frontend dispatches on Type instead of needing a connection per
+	// concern. hub.Broadcast itself is payload-agnostic ([]byte in,
+	// []byte out), so this envelope is purely a main.go/frontend contract.
 	type wsMessage struct {
 		Type string `json:"type"`
 		Data any    `json:"data"`
@@ -120,6 +129,23 @@ func main() {
 		}
 		return msg
 	}
+
+	// jobsMgr tracks long-running background work (currently just album
+	// art warming) so it's visible/reportable instead of a silent
+	// fire-and-forget goroutine — pushed over /ws the same way bucket
+	// download progress is, rather than the frontend polling for it.
+	jobsMgr := jobs.New(func(list []jobs.Job) {
+		hub.Broadcast(marshalWSMessage("jobs", list))
+	}, 0)
+	jobsAPI := &jobsAdapter{mgr: jobsMgr}
+
+	// coverArtFetcher is a best-effort fallback for tracks mpd itself has
+	// no art for — MusicBrainz + the Cover Art Archive, keyed by
+	// artist/album rather than the track URL. Always constructed (it's
+	// just an HTTP client with a rate limiter, no credentials/setup
+	// required), unlike the OLED/bucket-mode pieces above which are
+	// genuinely optional accessories.
+	artAPI := &artAdapter{mpd: mpdConn, coverArt: &coverart.Fetcher{}, library: p, store: artStore, jobs: jobsMgr}
 
 	// broadcastStatus fetches the current mpd status and pushes it to every
 	// connected WebSocket client. It's the shared endpoint for both the
@@ -179,7 +205,7 @@ func main() {
 				continue
 			}
 			hub.Broadcast(data)
-			updateOLEDElapsed(oled, status.Elapsed)
+			updateOLEDTrack(oled, status)
 
 			if status.Duration <= 0 || status.SongID == prefetchedFor {
 				continue
@@ -232,19 +258,28 @@ func main() {
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/", api.NewRouter(p, cfg, oled, bucketAPI))
+	mux.Handle("/api/", api.NewRouter(p, cfg, oled, bucketAPI, artAPI, jobsAPI))
+	// Resolved album art is served straight from disk by a plain
+	// http.FileServer — never through artAdapter, internal/artstore, or
+	// any other application code — once /api/albumart has redirected here
+	// the first time. See internal/api.Art's doc comment for why this
+	// matters on a 512MB Pi: no image bytes ever sit in the Go process's
+	// memory across requests.
+	mux.Handle("/art/", http.StripPrefix("/art/", http.FileServer(http.Dir(artStore.Dir()))))
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// Send the new client its current status and current bucket-
-		// download progress immediately, rather than leaving it to wait
-		// for the next unrelated state change of each — this is what lets
-		// a reloading UI show correct state right away (e.g. mid-download
-		// progress already in flight) instead of a stale/blank flash.
-		var initialStatus, initialDownloads []byte
+		// Send the new client its current status, bucket-download
+		// progress, and job status immediately, rather than leaving it to
+		// wait for the next unrelated state change of each — this is what
+		// lets a reloading UI show correct state right away (e.g.
+		// mid-download or mid-warm-scan already in flight) instead of a
+		// stale/blank flash.
+		var initialStatus []byte
 		if status, err := p.Status(); err == nil {
 			initialStatus = marshalWSMessage("status", status)
 		}
-		initialDownloads = marshalWSMessage("downloads", bucketAPI.Downloads())
-		if err := hub.ServeWS(w, r, initialStatus, initialDownloads); err != nil {
+		initialDownloads := marshalWSMessage("downloads", bucketAPI.Downloads())
+		initialJobs := marshalWSMessage("jobs", jobsMgr.List())
+		if err := hub.ServeWS(w, r, initialStatus, initialDownloads, initialJobs); err != nil {
 			log.Printf("ws upgrade failed: %v", err)
 		}
 	})

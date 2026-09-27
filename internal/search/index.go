@@ -182,6 +182,15 @@ func (idx *Index) Get(url string) (Result, bool, error) {
 	return r, true, nil
 }
 
+// Delete removes url from the index. Deleting a URL that isn't indexed is
+// not an error — it's already in the desired end state.
+func (idx *Index) Delete(url string) error {
+	if _, err := idx.db.Exec(`DELETE FROM urls WHERE url = ?`, url); err != nil {
+		return fmt.Errorf("search: delete %q: %w", url, err)
+	}
+	return nil
+}
+
 // Result is a single indexed entry.
 type Result struct {
 	URL    string `json:"url"`

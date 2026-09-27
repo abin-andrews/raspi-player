@@ -23,6 +23,16 @@ type fakeIndexer struct {
 	// metadata-enrichment goroutine's IndexURL call deterministically
 	// instead of polling or sleeping.
 	indexedCh chan indexer.Result
+	// getCh, if non-nil, is signaled (best effort) on every Get call — for
+	// a test asserting that indexAsync's background goroutine did
+	// *nothing* further (e.g. an already fully-tagged URL, where there's
+	// no IndexURL call to wait on instead): waiting for the Get call is a
+	// checkpoint proving the goroutine actually ran before the test checks
+	// that nothing changed.
+	getCh chan struct{}
+	// getCalls counts every Get call, for tests asserting an exact count
+	// (e.g. "exactly one lookup per song change, not one per Status call").
+	getCalls int
 }
 
 func (f *fakeIndexer) IndexURL(url, title, artist, album, tags string) error {
@@ -72,6 +82,15 @@ func (f *fakeIndexer) List(limit, offset int) ([]indexer.Result, error) {
 func (f *fakeIndexer) Get(url string) (indexer.Result, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.getCalls++
+	defer func() {
+		if f.getCh != nil {
+			select {
+			case f.getCh <- struct{}{}:
+			default:
+			}
+		}
+	}()
 	if f.err != nil {
 		return indexer.Result{}, false, f.err
 	}
@@ -81,6 +100,21 @@ func (f *fakeIndexer) Get(url string) (indexer.Result, bool, error) {
 		}
 	}
 	return indexer.Result{}, false, nil
+}
+
+func (f *fakeIndexer) Delete(url string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	for i, r := range f.indexed {
+		if r.URL == url {
+			f.indexed = append(f.indexed[:i], f.indexed[i+1:]...)
+			break
+		}
+	}
+	return nil
 }
 
 // fakeMetadataFetcher is an in-memory MetadataFetcher for tests. tags maps
@@ -158,8 +192,29 @@ func newTestPlayer() (*Player, *mpdclient.FakeClient, store.Store) {
 }
 
 func newTestPlayerWithIndexer() (*Player, *fakeIndexer) {
-	idx := &fakeIndexer{}
+	// indexedCh is buffered and only ever read by tests that specifically
+	// want to synchronize on it (see waitForIndexed) — index() runs
+	// asynchronously now (see its doc comment), so any test asserting on
+	// idx.indexed must wait for it rather than checking immediately.
+	idx := &fakeIndexer{indexedCh: make(chan indexer.Result, 4)}
 	return New(mpdclient.NewFakeClient(), store.NewMemoryStore(), idx, nil, nil, nil), idx
+}
+
+// waitForIndexed blocks until index()'s background goroutine has made its
+// first IndexURL call (or the test times out), returning what it indexed —
+// necessary because PlayURL/AddToQueue/AddFavorite/AddToPlaylist no longer
+// wait for indexing to complete before returning (see Player.index's doc
+// comment on why: it must not block the caller on the search-indexer
+// service's response time).
+func waitForIndexed(t *testing.T, idx *fakeIndexer) indexer.Result {
+	t.Helper()
+	select {
+	case result := <-idx.indexedCh:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the async IndexURL call")
+		return indexer.Result{}
+	}
 }
 
 func TestPlayURLAddsPlaysAndRecordsHistory(t *testing.T) {
@@ -185,6 +240,35 @@ func TestPlayURLAddsPlaysAndRecordsHistory(t *testing.T) {
 	}
 }
 
+func TestPlayURLJumpsToFrontAndPlaysImmediately(t *testing.T) {
+	p, mpd, _ := newTestPlayer()
+
+	if err := p.PlayURL("http://example.com/first.mp3"); err != nil {
+		t.Fatalf("PlayURL: %v", err)
+	}
+
+	// A second PlayURL while the first is already "playing" should switch
+	// to it immediately (State stays "play", Song becomes the new URL) and
+	// place it at the front of the queue, rather than just appending it
+	// behind whatever was already there.
+	if err := p.PlayURL("http://example.com/second.mp3"); err != nil {
+		t.Fatalf("PlayURL: %v", err)
+	}
+
+	if got, want := mpd.State, "play"; got != want {
+		t.Errorf("mpd state = %q, want %q", got, want)
+	}
+	if got, want := mpd.Song, "http://example.com/second.mp3"; got != want {
+		t.Errorf("mpd song = %q, want %q", got, want)
+	}
+	if len(mpd.QueueTracks) != 2 {
+		t.Fatalf("queue = %+v, want 2 tracks", mpd.QueueTracks)
+	}
+	if got, want := mpd.QueueTracks[0].URL, "http://example.com/second.mp3"; got != want {
+		t.Errorf("front of queue = %q, want %q (the just-played URL)", got, want)
+	}
+}
+
 func TestPlayURLIndexesBestEffort(t *testing.T) {
 	p, idx := newTestPlayerWithIndexer()
 
@@ -192,8 +276,8 @@ func TestPlayURLIndexesBestEffort(t *testing.T) {
 		t.Fatalf("PlayURL: %v", err)
 	}
 
-	if len(idx.indexed) != 1 || idx.indexed[0].URL != "http://example.com/stream.mp3" {
-		t.Errorf("indexed = %v, want one entry for the played URL", idx.indexed)
+	if got := waitForIndexed(t, idx); got.URL != "http://example.com/stream.mp3" {
+		t.Errorf("indexed = %+v, want one entry for the played URL", got)
 	}
 }
 
@@ -337,6 +421,101 @@ func TestLibraryWithoutIndexerErrors(t *testing.T) {
 	}
 }
 
+func TestAddToLibrary(t *testing.T) {
+	p, idx := newTestPlayerWithIndexer()
+
+	if err := p.AddToLibrary("http://example.com/a.mp3", "Dreams", "Fleetwood Mac", "Rumours", "classic"); err != nil {
+		t.Fatalf("AddToLibrary: %v", err)
+	}
+
+	if len(idx.indexed) != 1 {
+		t.Fatalf("indexed = %v, want one entry", idx.indexed)
+	}
+	got := idx.indexed[0]
+	if got.URL != "http://example.com/a.mp3" || got.Title != "Dreams" || got.Artist != "Fleetwood Mac" ||
+		got.Album != "Rumours" || got.Tags != "classic" {
+		t.Errorf("indexed = %+v, want the exact submitted fields", got)
+	}
+}
+
+func TestAddToLibraryFetchesMetadataWhenAllFieldsEmpty(t *testing.T) {
+	idx := &fakeIndexer{}
+	fetcher := &fakeMetadataFetcher{tags: map[string][3]string{
+		"http://example.com/a.mp3": {"Dreams", "Fleetwood Mac", "Rumours"},
+	}}
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), idx, nil, nil, fetcher)
+
+	if err := p.AddToLibrary("http://example.com/a.mp3", "", "", "", ""); err != nil {
+		t.Fatalf("AddToLibrary: %v", err)
+	}
+
+	if len(idx.indexed) != 1 || idx.indexed[0].Artist != "Fleetwood Mac" || idx.indexed[0].Album != "Rumours" {
+		t.Errorf("indexed = %v, want the fetched metadata used", idx.indexed)
+	}
+}
+
+func TestAddToLibrarySkipsMetadataFetchWhenAnyFieldProvided(t *testing.T) {
+	idx := &fakeIndexer{}
+	fetcher := &fakeMetadataFetcher{tags: map[string][3]string{
+		"http://example.com/a.mp3": {"Dreams", "Fleetwood Mac", "Rumours"},
+	}}
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), idx, nil, nil, fetcher)
+
+	if err := p.AddToLibrary("http://example.com/a.mp3", "My Own Title", "", "", ""); err != nil {
+		t.Fatalf("AddToLibrary: %v", err)
+	}
+
+	if len(fetcher.calls) != 0 {
+		t.Errorf("fetcher.calls = %v, want no metadata fetch when any field was provided", fetcher.calls)
+	}
+	if len(idx.indexed) != 1 || idx.indexed[0].Title != "My Own Title" || idx.indexed[0].Artist != "" {
+		t.Errorf("indexed = %v, want the submitted title used as-is, artist left blank", idx.indexed)
+	}
+}
+
+func TestAddToLibraryNormalizesURL(t *testing.T) {
+	p, idx := newTestPlayerWithIndexer()
+
+	if err := p.AddToLibrary("HTTP://Example.com:80/a.mp3", "A", "", "", ""); err != nil {
+		t.Fatalf("AddToLibrary: %v", err)
+	}
+
+	if len(idx.indexed) != 1 || idx.indexed[0].URL != "http://example.com/a.mp3" {
+		t.Errorf("indexed = %v, want the normalized URL", idx.indexed)
+	}
+}
+
+func TestAddToLibraryErrorsWithNoIndexer(t *testing.T) {
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), nil, nil, nil, nil)
+
+	if err := p.AddToLibrary("http://example.com/a.mp3", "A", "", "", ""); err == nil {
+		t.Error("AddToLibrary with no indexer configured: want error, got nil")
+	}
+}
+
+func TestRemoveFromLibrary(t *testing.T) {
+	idx := &fakeIndexer{indexed: []indexer.Result{
+		{URL: "http://example.com/a.mp3", Title: "A"},
+	}}
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if err := p.RemoveFromLibrary("http://example.com/a.mp3"); err != nil {
+		t.Fatalf("RemoveFromLibrary: %v", err)
+	}
+
+	if len(idx.indexed) != 0 {
+		t.Errorf("indexed = %v, want empty after removal", idx.indexed)
+	}
+}
+
+func TestRemoveFromLibraryErrorsWithNoIndexer(t *testing.T) {
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), nil, nil, nil, nil)
+
+	if err := p.RemoveFromLibrary("http://example.com/a.mp3"); err == nil {
+		t.Error("RemoveFromLibrary with no indexer configured: want error, got nil")
+	}
+}
+
 func TestPauseAndResume(t *testing.T) {
 	p, mpd, _ := newTestPlayer()
 
@@ -432,8 +611,8 @@ func TestAddFavoriteIndexesBestEffort(t *testing.T) {
 		t.Fatalf("AddFavorite: %v", err)
 	}
 
-	if len(idx.indexed) != 1 || idx.indexed[0].URL != "http://example.com/fav.mp3" {
-		t.Errorf("indexed = %v, want one entry for the favorited URL", idx.indexed)
+	if got := waitForIndexed(t, idx); got.URL != "http://example.com/fav.mp3" {
+		t.Errorf("indexed = %+v, want one entry for the favorited URL", got)
 	}
 }
 
@@ -447,8 +626,8 @@ func TestAddToPlaylistIndexesBestEffort(t *testing.T) {
 		t.Fatalf("AddToPlaylist: %v", err)
 	}
 
-	if len(idx.indexed) != 1 || idx.indexed[0].URL != "http://example.com/b.mp3" {
-		t.Errorf("indexed = %v, want one entry for the playlisted URL", idx.indexed)
+	if got := waitForIndexed(t, idx); got.URL != "http://example.com/b.mp3" {
+		t.Errorf("indexed = %+v, want one entry for the playlisted URL", got)
 	}
 }
 
@@ -543,6 +722,186 @@ func TestStatusFillsInTitleWhenMPDHasNone(t *testing.T) {
 	}
 }
 
+// waitForGet blocks until idx.getCh receives a signal — proof that a
+// background enrichStatus lookup for the current song actually ran, since
+// there's no other externally-visible side effect to synchronize on.
+func waitForGet(t *testing.T, idx *fakeIndexer) {
+	t.Helper()
+	select {
+	case <-idx.getCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the async status-enrichment Get call")
+	}
+}
+
+func TestStatusEnrichesFromIndexOnceLookupCompletes(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	mpd.Song = "http://example.com/a.mp3"
+	mpd.State = "play"
+	mpd.Artist = "Original Artist"
+	mpd.Album = "Original Album"
+	mpd.Title = "Original Title"
+	idx := &fakeIndexer{
+		indexed: []indexer.Result{
+			{URL: "http://example.com/a.mp3", Title: "Edited Title", Artist: "Edited Artist", Album: "Edited Album"},
+		},
+		getCh: make(chan struct{}, 4),
+	}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	// The first call for a new song kicks off the lookup in the background
+	// and returns immediately with mpd's own (unenriched) tags — it must
+	// never block on the indexer's response.
+	status, err := p.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Title != "Original Title" || status.Artist != "Original Artist" || status.Album != "Original Album" {
+		t.Errorf("first Status() = %+v, want mpd's own tags (enrichment hasn't resolved yet)", status)
+	}
+
+	waitForGet(t, idx)
+
+	status, err = p.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Title != "Edited Title" {
+		t.Errorf("Status.Title = %q, want the index's edited title to win over mpd's own tag", status.Title)
+	}
+	if status.Artist != "Edited Artist" {
+		t.Errorf("Status.Artist = %q, want the index's edited artist to win over mpd's own tag", status.Artist)
+	}
+	if status.Album != "Edited Album" {
+		t.Errorf("Status.Album = %q, want the index's edited album to win over mpd's own tag", status.Album)
+	}
+}
+
+func TestStatusEnrichmentDoesNotBlankFieldsTheIndexLeavesEmpty(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	mpd.Song = "http://example.com/a.mp3"
+	mpd.State = "play"
+	mpd.Artist = "mpd's own Artist"
+	mpd.Album = "mpd's own Album"
+	idx := &fakeIndexer{
+		// Only Album was ever edited — Artist was left blank in the index,
+		// which must not blank out mpd's own Artist tag.
+		indexed: []indexer.Result{
+			{URL: "http://example.com/a.mp3", Album: "Edited Album"},
+		},
+		getCh: make(chan struct{}, 4),
+	}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if _, err := p.Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	waitForGet(t, idx)
+
+	status, err := p.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Artist != "mpd's own Artist" {
+		t.Errorf("Status.Artist = %q, want mpd's own tag preserved (index left this field blank)", status.Artist)
+	}
+	if status.Album != "Edited Album" {
+		t.Errorf("Status.Album = %q, want the index's edited album", status.Album)
+	}
+}
+
+func TestStatusEnrichmentLooksUpOnceAndCachesForSameSong(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	mpd.Song = "http://example.com/a.mp3"
+	mpd.State = "play"
+	idx := &fakeIndexer{getCh: make(chan struct{}, 4)}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if _, err := p.Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	waitForGet(t, idx)
+
+	// Several more calls for the *same* song must not trigger another
+	// lookup — that's the whole point of caching per-song rather than
+	// looking up on every tick.
+	for i := 0; i < 5; i++ {
+		if _, err := p.Status(); err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+	}
+
+	idx.mu.Lock()
+	got := idx.getCalls
+	idx.mu.Unlock()
+	if got != 1 {
+		t.Errorf("Get calls = %d, want exactly 1 (one lookup per song, not one per Status call)", got)
+	}
+}
+
+func TestStatusEnrichmentRefetchesWhenSongChanges(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	mpd.Song = "http://example.com/a.mp3"
+	mpd.State = "play"
+	idx := &fakeIndexer{getCh: make(chan struct{}, 4)}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	if _, err := p.Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	waitForGet(t, idx)
+
+	mpd.Song = "http://example.com/b.mp3"
+	if _, err := p.Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	waitForGet(t, idx)
+
+	idx.mu.Lock()
+	got := idx.getCalls
+	idx.mu.Unlock()
+	if got != 2 {
+		t.Errorf("Get calls = %d, want exactly 2 (one per distinct song)", got)
+	}
+}
+
+// TestAddToLibraryRefreshesStatusEnrichmentForTheCurrentlyPlayingTrack
+// covers the exact bug report that motivated enrichStatus's invalidation
+// path: editing a track's metadata while that same track is already
+// playing (song URL unchanged throughout) must show up without needing to
+// change tracks first.
+func TestAddToLibraryRefreshesStatusEnrichmentForTheCurrentlyPlayingTrack(t *testing.T) {
+	mpd := mpdclient.NewFakeClient()
+	mpd.Song = "http://example.com/a.mp3"
+	mpd.State = "play"
+	mpd.Artist = "File Artist"
+	mpd.Album = "File Album"
+	idx := &fakeIndexer{getCh: make(chan struct{}, 4)}
+	p := New(mpd, store.NewMemoryStore(), idx, nil, nil, nil)
+
+	// First Status() call establishes the cache for the currently playing
+	// song — mirrors the real daemon's 1s status ticker already having
+	// polled at least once before the user gets around to editing anything.
+	if _, err := p.Status(); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	waitForGet(t, idx)
+
+	if err := p.AddToLibrary("http://example.com/a.mp3", "", "Edited Artist", "Edited Album", ""); err != nil {
+		t.Fatalf("AddToLibrary: %v", err)
+	}
+	waitForGet(t, idx) // the invalidation-triggered re-lookup
+
+	status, err := p.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Artist != "Edited Artist" || status.Album != "Edited Album" {
+		t.Errorf("Status = %+v, want the just-edited artist/album — editing the currently playing track "+
+			"must show up immediately, not only after the track changes", status)
+	}
+}
+
 func TestQueueUnresolvesBucketModeURLs(t *testing.T) {
 	mpd := mpdclient.NewFakeClient()
 	// Simulates bucket mode: mpd's queue only ever sees the resolved local
@@ -595,8 +954,8 @@ func TestAddToQueueIndexesBestEffort(t *testing.T) {
 		t.Fatalf("AddToQueue: %v", err)
 	}
 
-	if len(idx.indexed) != 1 || idx.indexed[0].URL != "http://example.com/a.mp3" {
-		t.Errorf("indexed = %v, want one entry for the queued URL", idx.indexed)
+	if got := waitForIndexed(t, idx); got.URL != "http://example.com/a.mp3" {
+		t.Errorf("indexed = %+v, want one entry for the queued URL", got)
 	}
 }
 
@@ -822,6 +1181,12 @@ func TestAddFavoriteNormalizesCaseVariantsToOneEntry(t *testing.T) {
 		t.Fatalf("AddFavorite (case variant): %v", err)
 	}
 
+	// Both AddFavorite calls kick off their own async index() call (see
+	// index's doc comment) — wait for both before asserting on the
+	// indexer's state.
+	waitForIndexed(t, idx)
+	waitForIndexed(t, idx)
+
 	favs, err := p.Favorites()
 	if err != nil {
 		t.Fatalf("Favorites: %v", err)
@@ -835,9 +1200,12 @@ func TestAddFavoriteNormalizesCaseVariantsToOneEntry(t *testing.T) {
 }
 
 func TestIndexReusesExistingFullyTaggedEntryWithoutRefetchingMetadata(t *testing.T) {
-	idx := &fakeIndexer{indexed: []indexer.Result{
-		{URL: "http://example.com/a.mp3", Title: "Dreams", Artist: "Fleetwood Mac", Album: "Rumours"},
-	}}
+	idx := &fakeIndexer{
+		indexed: []indexer.Result{
+			{URL: "http://example.com/a.mp3", Title: "Dreams", Artist: "Fleetwood Mac", Album: "Rumours"},
+		},
+		getCh: make(chan struct{}, 1),
+	}
 	fetcher := &fakeMetadataFetcher{tags: map[string][3]string{
 		"http://example.com/a.mp3": {"Dreams", "Fleetwood Mac", "Rumours"},
 	}}
@@ -845,6 +1213,17 @@ func TestIndexReusesExistingFullyTaggedEntryWithoutRefetchingMetadata(t *testing
 
 	if err := p.AddToQueue("http://example.com/a.mp3"); err != nil {
 		t.Fatalf("AddToQueue: %v", err)
+	}
+
+	// An already fully-tagged URL makes no further calls at all (that's
+	// the whole point of this test), so there's no "it happened" signal
+	// to wait on directly — instead, wait for the Get call indexAsync
+	// always makes first, which proves the goroutine actually ran and
+	// reached its "return early" branch before asserting nothing else did.
+	select {
+	case <-idx.getCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the async Get call")
 	}
 
 	if len(idx.indexed) != 1 || idx.indexed[0].Title != "Dreams" {

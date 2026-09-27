@@ -34,7 +34,39 @@ export const previous = () => request('POST', '/api/previous')
 export const setVolume = (volume) => request('POST', '/api/volume', { volume })
 
 // Not a JSON fetch — returns the URL directly for use as an <img src>.
-export const albumArtUrl = (url) => `/api/albumart?url=${encodeURIComponent(url)}`
+// artist/album are optional hints used only for a MusicBrainz/Cover Art
+// Archive fallback lookup server-side if mpd itself has nothing.
+export const albumArtUrl = (url, artist, album) => {
+  const params = new URLSearchParams({ url })
+  if (artist) params.set('artist', artist)
+  if (album) params.set('album', album)
+  return `/api/albumart?${params.toString()}`
+}
+
+// Cheap cache lookup (never a fetch) reporting, for each of urls, whether
+// art is already known to exist — a url this has no answer for yet
+// (never fetched, or a past fetch errored) is simply omitted from the
+// result, distinguishing "confirmed no art" (false) from "don't know yet".
+export const queryAlbumArt = (urls) => request('POST', '/api/albumart/query', { urls })
+
+// Bypasses whatever's already known and always re-resolves — e.g. a file
+// was re-tagged with new art since it was last resolved, or you want to
+// retry the MusicBrainz fallback now that it's configured.
+export const refreshAlbumArt = (url, artist, album) =>
+  request('POST', '/api/albumart/refresh', { url, artist, album })
+
+// Kicks off a background scan of the whole library, pre-fetching and
+// caching art (including confirmed-negative results) for every entry not
+// already known — an explicit "warm the cache" action rather than only
+// discovering art lazily, one track at a time, as each is first viewed.
+// Returns immediately; the scan itself runs in the background (progress
+// arrives over /ws as a "jobs" envelope — see useDaemonSocket.js).
+export const warmAlbumArt = () => request('POST', '/api/albumart/warm')
+
+// Every currently-tracked background job (running or recently finished) —
+// normally received pushed over /ws instead (see useDaemonSocket.js), but
+// available for a one-off check.
+export const getJobs = () => request('GET', '/api/jobs')
 
 // Opens a WebSocket to the daemon's live push feed. Calls onMessage with
 // each parsed {type, data} envelope as it arrives (type is "status" or
@@ -74,6 +106,15 @@ export const search = (query, limit = 25) =>
 // no query needed, unlike search(). The "media library" browsing view.
 export const getLibrary = (limit = 25, offset = 0) =>
   request('GET', `/api/library?limit=${limit}&offset=${offset}`)
+
+// Upserts a library entry by URL — the same call for both adding a new
+// entry and editing an existing one (resubmit with the same url, changed
+// fields). Distinct from playURL/addFavorite/addToPlaylist/addToQueue,
+// which index a URL only as a side effect of doing something else.
+export const addToLibrary = (url, title, artist, album, tags) =>
+  request('POST', '/api/library', { url, title, artist, album, tags })
+export const removeFromLibrary = (url) =>
+  request('DELETE', `/api/library?url=${encodeURIComponent(url)}`)
 
 // mpd's actual live playback queue — distinct from the app's saved named
 // Playlists above.
