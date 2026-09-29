@@ -13,6 +13,7 @@ import (
 
 	"pi-streamer/internal/api"
 	"pi-streamer/internal/artstore"
+	"pi-streamer/internal/audioinfo"
 	"pi-streamer/internal/bucket"
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/coverart"
@@ -114,7 +115,13 @@ func main() {
 	defer oled.close()
 	cfg := &configAdapter{store: cfgStore, oled: oled, cache: cache, favorites: favorites, getStatus: p.Status}
 	cfg.apply(cfgStore.Get())
-	bucketAPI := &bucketAdapter{cfg: cfgStore, cache: cache, favorites: favorites}
+	bucketAPI := &bucketAdapter{
+		cfg:       cfgStore,
+		cache:     cache,
+		favorites: favorites,
+		trackInfo: p,
+		prober:    &audioinfo.Prober{},
+	}
 
 	// wsMessage envelopes every payload multiplexed over the single /ws
 	// connection (status, bucket download progress, job progress, ...) so

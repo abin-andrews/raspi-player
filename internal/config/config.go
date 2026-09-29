@@ -68,7 +68,6 @@ func IsAllowedMode(mode PlaybackMode) bool {
 const (
 	DefaultBucketMaxSizeMB    = 512  // the evictable playback cache
 	DefaultFavoritesMaxSizeMB = 1024 // the permanent favorites archive
-	DefaultMinFreeMB          = 512  // safety margin, shared by both
 )
 
 // Bucket holds the local audio-file cache's settings — see internal/bucket.
@@ -78,20 +77,16 @@ const (
 // it does have its own ceiling, since "permanent" still shouldn't mean
 // "unbounded": once it's full, saving a new favorite fails outright rather
 // than evicting an existing one (see internal/bucket.Store's evictable
-// flag). MinFreeMB is a disk-space safety margin both stores independently
-// refuse to cross, regardless of their own caps.
+// flag). There used to also be a MinFreeMB disk-space safety margin shared
+// by both stores — removed as redundant once both had their own size caps;
+// see internal/bucket.Store's history if a hard SD-card-space floor turns
+// out to be needed again independent of either cap.
 type Bucket struct {
 	Mode      PlaybackMode `json:"mode"`
 	MaxSizeMB int          `json:"maxSizeMb"`
 	// FavoritesMaxSizeMB caps the permanent favorites archive. Zero means
 	// DefaultFavoritesMaxSizeMB.
 	FavoritesMaxSizeMB int `json:"favoritesMaxSizeMb"`
-	// MinFreeMB is the minimum free disk space (on the filesystem holding
-	// both stores) either one will leave itself. Zero means
-	// DefaultMinFreeMB — there is no "0 disables the margin" option;
-	// disabling it isn't offered since it makes it too easy to fill an SD
-	// card solid.
-	MinFreeMB int `json:"minFreeMb"`
 }
 
 // UI holds settings for the web frontend's own behavior — distinct from

@@ -150,7 +150,7 @@ function App() {
         </AppShell.Header>
 
         <AppShell.Main>
-          <Container size="sm">
+          <Container size="xl">
             {/* keepMounted=false: Mantine otherwise renders every tab's
                 panel (and keeps it mounted, effects/polling and all) at
                 once, so switching tabs never unmounts anything — on a

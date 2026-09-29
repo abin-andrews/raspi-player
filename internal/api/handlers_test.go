@@ -159,6 +159,8 @@ type fakeBucket struct {
 	queryResp     map[string]bool
 	listResp      []BucketEntry
 	listErr       error
+	removeCalls   []string
+	removeErr     error
 	downloadsResp []BucketDownload
 }
 
@@ -176,6 +178,11 @@ func (f *fakeBucket) List() ([]BucketEntry, error) {
 		return nil, f.listErr
 	}
 	return f.listResp, nil
+}
+
+func (f *fakeBucket) Remove(url string) error {
+	f.removeCalls = append(f.removeCalls, url)
+	return f.removeErr
 }
 
 func (f *fakeBucket) Downloads() []BucketDownload { return f.downloadsResp }
@@ -1610,6 +1617,32 @@ func TestHandleBucketListError(t *testing.T) {
 	}
 }
 
+func TestHandleBucketRemove(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
+
+	rec := doRequest(t, h, "DELETE", "/api/bucket?url=http://example.com/a.mp3", "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(b.removeCalls) != 1 || b.removeCalls[0] != "http://example.com/a.mp3" {
+		t.Errorf("removeCalls = %v, want [http://example.com/a.mp3]", b.removeCalls)
+	}
+}
+
+func TestHandleBucketRemoveError(t *testing.T) {
+	p := newFakePlayer()
+	b := newFakeBucket()
+	b.removeErr = errors.New("remove failed")
+	h := NewRouter(p, newFakeConfig(), newFakeOled(), b, newFakeArt(), newFakeJobs())
+
+	rec := doRequest(t, h, "DELETE", "/api/bucket?url=http://example.com/a.mp3", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
 func TestHandleBucketDownloads(t *testing.T) {
 	p := newFakePlayer()
 	b := newFakeBucket()
@@ -1657,11 +1690,11 @@ func TestHandleSetConfigValidBucketSettings(t *testing.T) {
 	h := NewRouter(p, cfg, newFakeOled(), newFakeBucket(), newFakeArt(), newFakeJobs())
 
 	rec := doRequest(t, h, "PUT", "/api/config",
-		`{"bucket":{"mode":"bucket","maxSizeMb":1024,"favoritesMaxSizeMb":2048,"minFreeMb":512}}`)
+		`{"bucket":{"mode":"bucket","maxSizeMb":1024,"favoritesMaxSizeMb":2048}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	want := config.Bucket{Mode: config.ModeBucket, MaxSizeMB: 1024, FavoritesMaxSizeMB: 2048, MinFreeMB: 512}
+	want := config.Bucket{Mode: config.ModeBucket, MaxSizeMB: 1024, FavoritesMaxSizeMB: 2048}
 	if len(cfg.setCalls) != 1 || cfg.setCalls[0].Bucket != want {
 		t.Errorf("setCalls = %+v, want [%+v]", cfg.setCalls, want)
 	}

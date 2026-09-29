@@ -91,6 +91,8 @@ type Oled interface {
 
 // BucketStatus reports current usage of both the evictable playback cache
 // and the permanent favorites archive, for the Settings tab's display.
+// DiskFreeBytes is purely informational (no enforced margin backs it —
+// that was removed as redundant once both stores had their own size caps).
 type BucketStatus struct {
 	Mode               string `json:"mode"`
 	UsedBytes          int64  `json:"usedBytes"`
@@ -98,16 +100,33 @@ type BucketStatus struct {
 	FavoritesUsedBytes int64  `json:"favoritesUsedBytes"`
 	FavoritesMaxBytes  int64  `json:"favoritesMaxBytes"`
 	DiskFreeBytes      int64  `json:"diskFreeBytes"`
-	MinFreeBytes       int64  `json:"minFreeBytes"`
 }
 
 // BucketEntry describes one file cached in the playback bucket, for the
 // Bucket tab's browsing view. URL is empty if this entry predates the
-// bucket's URL index (see internal/bucket.Entry).
+// bucket's URL index (see internal/bucket.Entry). Title/Artist/Album are
+// best-effort, from the search index (empty if unindexed or no indexer is
+// configured) — filled in so the listing is actually identifiable at a
+// glance rather than just a bare URL, which matters for a manual "find
+// and remove this one entry" testing workflow. The Codec/SampleRateHz/
+// Channels/BitsPerSample/BitrateKbps/DurationSeconds fields are probed
+// directly from the cached file on disk (via ffprobe — see
+// internal/audioinfo) and are all zero-valued if probing failed for any
+// reason (ffprobe missing, an unrecognized/corrupt file) — best-effort,
+// same as the metadata fields, never fails the whole listing.
 type BucketEntry struct {
-	URL          string    `json:"url"`
-	SizeBytes    int64     `json:"sizeBytes"`
-	LastAccessed time.Time `json:"lastAccessed"`
+	URL             string    `json:"url"`
+	SizeBytes       int64     `json:"sizeBytes"`
+	LastAccessed    time.Time `json:"lastAccessed"`
+	Title           string    `json:"title,omitempty"`
+	Artist          string    `json:"artist,omitempty"`
+	Album           string    `json:"album,omitempty"`
+	Codec           string    `json:"codec,omitempty"`
+	SampleRateHz    int       `json:"sampleRateHz,omitempty"`
+	Channels        int       `json:"channels,omitempty"`
+	BitsPerSample   int       `json:"bitsPerSample,omitempty"`
+	BitrateKbps     int       `json:"bitrateKbps,omitempty"`
+	DurationSeconds float64   `json:"durationSeconds,omitempty"`
 }
 
 // Bucket is the subset of the daemon's local audio-file cache's behavior
@@ -122,6 +141,13 @@ type Bucket interface {
 	// (not the favorites archive — that's already browsable via
 	// GET /api/favorites), for the Bucket tab.
 	List() ([]BucketEntry, error)
+	// Remove deletes one entry from the playback cache by URL — a manual
+	// "clear this one out" action (e.g. for testing a re-download), not an
+	// error if url isn't actually cached. Deliberately scoped to the
+	// playback cache only, never the favorites archive: un-favoriting
+	// (which does clear a favorite's own archived copy) is the existing,
+	// separate way to remove something from there.
+	Remove(url string) error
 	// Downloads reports every download currently in flight, across both
 	// the playback cache and the favorites archive, for a UI to poll and
 	// show live progress (on-demand plays, background prefetches, and
@@ -285,6 +311,7 @@ func NewRouter(p Player, cfg Config, o Oled, b Bucket, art Art, j Jobs) http.Han
 	mux.HandleFunc("GET /api/bucket/status", handleBucketStatus(b))
 	mux.HandleFunc("POST /api/bucket/query", handleBucketQuery(b))
 	mux.HandleFunc("GET /api/bucket/list", handleBucketList(b))
+	mux.HandleFunc("DELETE /api/bucket", handleBucketRemove(b))
 	mux.HandleFunc("GET /api/bucket/downloads", handleBucketDownloads(b))
 
 	return mux

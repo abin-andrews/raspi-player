@@ -725,9 +725,6 @@ func validateBucket(b config.Bucket) error {
 	if b.FavoritesMaxSizeMB < 0 {
 		return errors.New("favorites max size must not be negative")
 	}
-	if b.MinFreeMB < 0 {
-		return errors.New("minimum free disk space must not be negative")
-	}
 	return nil
 }
 
@@ -797,6 +794,20 @@ func handleBucketList(b Bucket) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, entries)
+	}
+}
+
+// handleBucketRemove deletes one entry from the playback cache by URL —
+// same DELETE-by-query-param shape as handleRemoveFavorite, not an error
+// if url wasn't actually cached (see Bucket.Remove's own doc comment).
+func handleBucketRemove(b Bucket) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		url := r.URL.Query().Get("url")
+		if err := b.Remove(url); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusNoContent, nil)
 	}
 }
 

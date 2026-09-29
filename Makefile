@@ -24,8 +24,10 @@ all: build
 # Debian/Ubuntu dev machine setup: Go toolchain + mpd/mpc for local testing,
 # plus yt-dlp + ffmpeg for extracting audio from YouTube URLs (internal/
 # ytdlp) — ffmpeg is yt-dlp's own dependency for --embed-metadata and for
-# some audio-only formats' post-processing, not something this daemon
-# invokes directly itself.
+# some audio-only formats' post-processing. The daemon also invokes
+# ffprobe (part of the same ffmpeg package) directly itself, via
+# internal/audioinfo, to read cached files' technical audio properties
+# for the Bucket tab's listing.
 install-deps:
 	sudo apt-get update
 	sudo apt-get install -y golang-go mpd mpc yt-dlp ffmpeg

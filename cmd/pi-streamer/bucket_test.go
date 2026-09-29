@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 
+	"pi-streamer/internal/audioinfo"
 	"pi-streamer/internal/bucket"
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/urlcheck"
@@ -145,5 +147,130 @@ func TestResolveNonYouTubeURLIsUnaffectedByYtdlpBeingConfigured(t *testing.T) {
 	}
 	if got != srv.URL+"/track.mp3" {
 		t.Errorf("Resolve() = %q, want the original URL unchanged in stream mode", got)
+	}
+}
+
+// fakeTrackInfoLookup is an in-memory trackInfoLookup for tests.
+type fakeTrackInfoLookup struct {
+	results map[string][3]string // url -> [title, artist, album]
+	err     error
+}
+
+func (f *fakeTrackInfoLookup) TrackInfo(url string) (title, artist, album string, err error) {
+	if f.err != nil {
+		return "", "", "", f.err
+	}
+	r := f.results[url]
+	return r[0], r[1], r[2], nil
+}
+
+// fakeAudioProber is an in-memory audioProber for tests.
+type fakeAudioProber struct {
+	info  audioinfo.Info
+	err   error
+	calls []string
+}
+
+func (f *fakeAudioProber) Probe(ctx context.Context, path string) (audioinfo.Info, error) {
+	f.calls = append(f.calls, path)
+	if f.err != nil {
+		return audioinfo.Info{}, f.err
+	}
+	return f.info, nil
+}
+
+func newTestBucketAdapter(t *testing.T) (*bucketAdapter, *bucket.Store) {
+	t.Helper()
+	cache, err := bucket.Open(t.TempDir(), 0, true)
+	if err != nil {
+		t.Fatalf("bucket.Open: %v", err)
+	}
+	favorites, err := bucket.Open(t.TempDir(), 0, false)
+	if err != nil {
+		t.Fatalf("bucket.Open: %v", err)
+	}
+	cfgStore, err := config.Open(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("config.Open: %v", err)
+	}
+	return &bucketAdapter{cfg: cfgStore, cache: cache, favorites: favorites}, cache
+}
+
+func TestBucketAdapterListEnrichesWithTrackInfoAndAudioInfo(t *testing.T) {
+	b, cache := newTestBucketAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("fake-audio-bytes"))
+	}))
+	defer srv.Close()
+	if _, err := cache.Download(context.Background(), srv.URL+"/track.mp3"); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	b.trackInfo = &fakeTrackInfoLookup{results: map[string][3]string{
+		srv.URL + "/track.mp3": {"Dreams", "Fleetwood Mac", "Rumours"},
+	}}
+	prober := &fakeAudioProber{info: audioinfo.Info{Codec: "mp3", SampleRateHz: 44100, Channels: 2, BitrateKbps: 320}}
+	b.prober = prober
+
+	entries, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %v, want exactly one", entries)
+	}
+	e := entries[0]
+	if e.Title != "Dreams" || e.Artist != "Fleetwood Mac" || e.Album != "Rumours" {
+		t.Errorf("title/artist/album = %q/%q/%q, want Dreams/Fleetwood Mac/Rumours", e.Title, e.Artist, e.Album)
+	}
+	if e.Codec != "mp3" || e.SampleRateHz != 44100 || e.Channels != 2 || e.BitrateKbps != 320 {
+		t.Errorf("audio info = %+v, want the fake prober's result", e)
+	}
+	if len(prober.calls) != 1 {
+		t.Errorf("prober.calls = %v, want exactly one probe", prober.calls)
+	}
+}
+
+func TestBucketAdapterListSkipsEnrichmentWhenNotConfigured(t *testing.T) {
+	b, cache := newTestBucketAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("fake-audio-bytes"))
+	}))
+	defer srv.Close()
+	if _, err := cache.Download(context.Background(), srv.URL+"/track.mp3"); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	// b.trackInfo/b.prober deliberately left nil.
+	entries, err := b.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %v, want exactly one", entries)
+	}
+	if entries[0].Title != "" || entries[0].Codec != "" {
+		t.Errorf("entry = %+v, want no enrichment with nil trackInfo/prober", entries[0])
+	}
+}
+
+func TestBucketAdapterRemoveDeletesFromPlaybackCacheOnly(t *testing.T) {
+	b, cache := newTestBucketAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("fake-audio-bytes"))
+	}))
+	defer srv.Close()
+	if _, err := cache.Download(context.Background(), srv.URL+"/track.mp3"); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if !cache.Contains(srv.URL + "/track.mp3") {
+		t.Fatal("expected the track to be cached before Remove")
+	}
+
+	if err := b.Remove(srv.URL + "/track.mp3"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if cache.Contains(srv.URL + "/track.mp3") {
+		t.Error("Remove: track still cached after removal")
 	}
 }

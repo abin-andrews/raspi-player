@@ -119,18 +119,35 @@ func HQThumbnailURL(youtubeURL string) (string, bool) {
 
 // DefaultThumbnailURL returns the URL of youtubeURL's smallest generated
 // thumbnail (120x90, YouTube's "default" size — generated for every video
-// without exception, the same guarantee HQThumbnailURL has for its own
-// size). Deliberately preferred over the larger sizes for a *list* of many
-// thumbnails at once (the Library/Queue/search-results views) — smaller
-// images there mean less bandwidth and faster loading for something shown
-// at a small size anyway; HQThumbnailURL is for the few places a single
-// track's art is shown large.
+// without exception, the same guarantee HQThumbnailURL/MediumThumbnailURL
+// have for their own sizes). Tried first for list views, then found to be
+// too low-resolution in practice — a 120x90 source stretched to cover a
+// ~120px-square tile (object-fit: cover scales the shorter dimension up
+// to fill the box, then crops) visibly upscales and blurs — so
+// MediumThumbnailURL is what list views actually use now; this is kept as
+// a still-valid, tested public helper for anything that genuinely wants
+// the smallest possible thumbnail.
 func DefaultThumbnailURL(youtubeURL string) (string, bool) {
 	id, ok := VideoID(youtubeURL)
 	if !ok {
 		return "", false
 	}
 	return "https://i.ytimg.com/vi/" + id + "/default.jpg", true
+}
+
+// MediumThumbnailURL returns the URL of youtubeURL's "medium quality"
+// (320x180) thumbnail — generated for every video without exception, same
+// guarantee as the other sizes. The actual size list views (Library/Queue/
+// search results) use: large enough to still look sharp after being
+// scaled down to a ~120px tile (downscaling, unlike DefaultThumbnailURL's
+// upscale-and-blur at that size), while still much lighter than
+// HQThumbnailURL's 480x360 for a screen showing many of these at once.
+func MediumThumbnailURL(youtubeURL string) (string, bool) {
+	id, ok := VideoID(youtubeURL)
+	if !ok {
+		return "", false
+	}
+	return "https://i.ytimg.com/vi/" + id + "/mqdefault.jpg", true
 }
 
 // TitleFetcher fetches a YouTube video's title via YouTube's own oEmbed

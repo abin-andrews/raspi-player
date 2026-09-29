@@ -135,6 +135,23 @@ func TestDefaultThumbnailURLReturnsFalseWithoutAnExtractableVideoID(t *testing.T
 	}
 }
 
+func TestMediumThumbnailURLUsesTheExtractedVideoID(t *testing.T) {
+	got, ok := MediumThumbnailURL("https://www.youtube.com/watch?v=abc123XYZ90")
+	if !ok {
+		t.Fatal("MediumThumbnailURL: want ok=true")
+	}
+	want := "https://i.ytimg.com/vi/abc123XYZ90/mqdefault.jpg"
+	if got != want {
+		t.Errorf("MediumThumbnailURL() = %q, want %q", got, want)
+	}
+}
+
+func TestMediumThumbnailURLReturnsFalseWithoutAnExtractableVideoID(t *testing.T) {
+	if _, ok := MediumThumbnailURL("https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"); ok {
+		t.Error("MediumThumbnailURL: want ok=false for a URL with no video ID")
+	}
+}
+
 func TestThumbnailURLFailsWithoutAnExtractableVideoID(t *testing.T) {
 	if _, ok := ThumbnailURL("https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"); ok {
 		t.Error("ThumbnailURL: want ok=false for a URL with no video ID")

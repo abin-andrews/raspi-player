@@ -95,7 +95,6 @@ function Settings({ downloads = [], jobs = [] }) {
   const [mode, setMode] = useState('stream')
   const [maxSizeMb, setMaxSizeMb] = useState('')
   const [favoritesMaxSizeMb, setFavoritesMaxSizeMb] = useState('')
-  const [minFreeMb, setMinFreeMb] = useState('')
   const [bucketStatus, setBucketStatus] = useState(null)
 
   const [hideVolumeControl, setHideVolumeControl] = useState(false)
@@ -141,7 +140,6 @@ function Settings({ downloads = [], jobs = [] }) {
     setMode(cfg?.bucket?.mode || 'stream')
     setMaxSizeMb(cfg?.bucket?.maxSizeMb ? String(cfg.bucket.maxSizeMb) : '')
     setFavoritesMaxSizeMb(cfg?.bucket?.favoritesMaxSizeMb ? String(cfg.bucket.favoritesMaxSizeMb) : '')
-    setMinFreeMb(cfg?.bucket?.minFreeMb ? String(cfg.bucket.minFreeMb) : '')
     setHideVolumeControl(Boolean(cfg?.ui?.hideVolumeControl))
   }
 
@@ -176,7 +174,6 @@ function Settings({ downloads = [], jobs = [] }) {
           mode,
           maxSizeMb: Number(maxSizeMb) || 0,
           favoritesMaxSizeMb: Number(favoritesMaxSizeMb) || 0,
-          minFreeMb: Number(minFreeMb) || 0,
         },
         ui: { hideVolumeControl },
       })
@@ -381,8 +378,7 @@ function Settings({ downloads = [], jobs = [] }) {
           bucket" downloads it locally first, then hands the local file to mpd — more robust
           against a flaky remote server mid-playback. The bucket cache evicts your
           least-recently-played tracks once it hits its size limit; favorited tracks are saved
-          separately and permanently instead (never auto-deleted), up to their own limit. A
-          safety margin always keeps some space free on the SD card regardless of either limit.
+          separately and permanently instead (never auto-deleted), up to their own limit.
         </Text>
 
         <Select
@@ -409,14 +405,6 @@ function Settings({ downloads = [], jobs = [] }) {
             min={0}
             value={favoritesMaxSizeMb}
             onChange={(v) => setFavoritesMaxSizeMb(v === '' ? '' : String(v))}
-          />
-          <NumberInput
-            label="Safety margin (MB)"
-            description="Minimum free disk space either store will always leave"
-            placeholder="512"
-            min={0}
-            value={minFreeMb}
-            onChange={(v) => setMinFreeMb(v === '' ? '' : String(v))}
           />
         </Group>
 
@@ -448,8 +436,7 @@ function Settings({ downloads = [], jobs = [] }) {
               color="grape"
             />
             <Text size="xs" c="dimmed" mt="xs">
-              Disk free: {formatBytes(bucketStatus.diskFreeBytes)} (margin:{' '}
-              {formatBytes(bucketStatus.minFreeBytes)})
+              Disk free: {formatBytes(bucketStatus.diskFreeBytes)}
             </Text>
           </Stack>
         )}

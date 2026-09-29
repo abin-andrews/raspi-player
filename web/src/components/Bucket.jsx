@@ -1,8 +1,26 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { ActionIcon, Alert, Badge, Card, Group, Progress, Stack, Text, Title } from '@mantine/core'
-import { IconDownload, IconHeart, IconHeartFilled } from '@tabler/icons-react'
-import { addFavorite, getBucketList, listFavorites, removeFavorite } from '../api.js'
-import { formatBytes } from '../format.js'
+import { IconDownload, IconHeart, IconHeartFilled, IconTrash } from '@tabler/icons-react'
+import { addFavorite, getBucketList, listFavorites, removeBucketEntry, removeFavorite } from '../api.js'
+import { formatBytes, formatTime } from '../format.js'
+
+// Builds a compact "MP3 · 320 kbps · 44.1 kHz · 2ch" style summary from
+// one entry's probed audio properties (see internal/audioinfo — codec/
+// sample rate/channels/bit depth/bitrate are all best-effort, empty/zero
+// if ffprobe couldn't determine them) — rich enough to actually tell
+// cached files apart at a glance, which is the point of surfacing this at
+// all (a manual "find and remove this one" testing workflow needs more to
+// go on than a bare URL and a file size).
+function formatAudioInfo(e) {
+  const parts = []
+  if (e.codec) parts.push(e.codec.toUpperCase())
+  if (e.bitsPerSample) parts.push(`${e.bitsPerSample}-bit`)
+  if (e.sampleRateHz) parts.push(`${(e.sampleRateHz / 1000).toFixed(1)} kHz`)
+  if (e.channels) parts.push(`${e.channels}ch`)
+  if (e.bitrateKbps) parts.push(`${e.bitrateKbps} kbps`)
+  if (e.durationSeconds) parts.push(formatTime(e.durationSeconds))
+  return parts.join(' · ')
+}
 
 // Browses the evictable playback cache's contents (see internal/bucket) —
 // distinct from the Favorites tab, which lists the app's own saved
@@ -65,6 +83,24 @@ function Bucket({ downloads = [] }) {
     }
   }
 
+  // Manual per-entry removal — mainly for testing (forcing a fresh
+  // re-download next time it's played/queued) or just freeing space on
+  // demand, without waiting for LRU eviction to get to it.
+  async function handleRemove(entry) {
+    const label = entry.title || entry.url || 'this cached entry'
+    if (!window.confirm(`Remove "${label}" from the bucket cache?`)) return
+    setError(null)
+    setPending(entry.url)
+    try {
+      await removeBucketEntry(entry.url)
+      await refresh()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setPending(null)
+    }
+  }
+
   return (
     <Stack>
       {error && (
@@ -115,31 +151,58 @@ function Bucket({ downloads = [] }) {
         )}
         {entries.map((e) => {
           const isFavorite = favoriteUrls.has(e.url)
+          const audioInfo = formatAudioInfo(e)
           return (
             <Card key={e.url || e.lastAccessed} withBorder padding="sm">
               <Group justify="space-between" wrap="nowrap">
                 <Stack gap={0} style={{ minWidth: 0 }}>
                   <Text fw={500} truncate="end">
-                    {e.url || '(unlabeled cache entry)'}
+                    {e.title || e.url || '(unlabeled cache entry)'}
                   </Text>
-                  <Group gap="xs">
+                  {(e.artist || e.album) && (
+                    <Text size="xs" c="dimmed" truncate="end">
+                      {[e.artist, e.album].filter(Boolean).join(' — ')}
+                    </Text>
+                  )}
+                  {e.title && e.url && (
+                    <Text size="xs" c="dimmed" truncate="end">
+                      {e.url}
+                    </Text>
+                  )}
+                  <Group gap="xs" mt={2}>
                     <Badge size="xs" variant="light">
                       {formatBytes(e.sizeBytes)}
                     </Badge>
+                    {audioInfo && (
+                      <Badge size="xs" variant="outline" color="gray">
+                        {audioInfo}
+                      </Badge>
+                    )}
                     <Text size="xs" c="dimmed">
                       last played {new Date(e.lastAccessed).toLocaleString()}
                     </Text>
                   </Group>
                 </Stack>
-                <ActionIcon
-                  variant={isFavorite ? 'filled' : 'subtle'}
-                  color="red"
-                  disabled={!e.url || pending === e.url}
-                  onClick={() => handleToggleFavorite(e.url)}
-                  aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-                >
-                  {isFavorite ? <IconHeartFilled size={16} /> : <IconHeart size={16} />}
-                </ActionIcon>
+                <Group gap={4} wrap="nowrap">
+                  <ActionIcon
+                    variant={isFavorite ? 'filled' : 'subtle'}
+                    color="red"
+                    disabled={!e.url || pending === e.url}
+                    onClick={() => handleToggleFavorite(e.url)}
+                    aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+                  >
+                    {isFavorite ? <IconHeartFilled size={16} /> : <IconHeart size={16} />}
+                  </ActionIcon>
+                  <ActionIcon
+                    variant="subtle"
+                    color="gray"
+                    disabled={pending === e.url}
+                    onClick={() => handleRemove(e)}
+                    aria-label="Remove from cache"
+                  >
+                    <IconTrash size={16} />
+                  </ActionIcon>
+                </Group>
               </Group>
             </Card>
           )

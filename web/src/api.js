@@ -164,6 +164,11 @@ export const queryBucketCached = (urls) => request('POST', '/api/bucket/query', 
 // Every file currently in the evictable playback cache (not the favorites
 // archive — that's browsed via listFavorites instead).
 export const getBucketList = () => request('GET', '/api/bucket/list')
+// Manually deletes one entry from the playback cache by URL — for testing
+// (forcing a re-download) or just freeing space on demand. Never touches
+// the favorites archive; un-favoriting is the separate way to remove
+// something from there.
+export const removeBucketEntry = (url) => request('DELETE', `/api/bucket?url=${encodeURIComponent(url)}`)
 // In-flight downloads (on-demand plays, background prefetch, and favorite
 // archiving all show up here) — meant to be polled while any are active.
 export const getBucketDownloads = () => request('GET', '/api/bucket/downloads')

@@ -308,11 +308,11 @@ func TestQueryReportsYouTubeThumbnailForAnUnresolvedURL(t *testing.T) {
 
 	got := a.Query([]string{"https://youtu.be/abc123XYZ90"})
 
-	// Deliberately the small default.jpg, not hqdefault.jpg — Query backs
-	// list views showing many thumbnails at once (see resolve's own test,
+	// mqdefault.jpg, not the smallest default.jpg (blurs when upscaled to
+	// a list tile) or hqdefault.jpg (resolve's own test,
 	// TestResolveReturnsDirectYouTubeThumbnailURLInsteadOfMPD, for the
 	// bigger size used for a single prominently-displayed track).
-	want := "https://i.ytimg.com/vi/abc123XYZ90/default.jpg"
+	want := "https://i.ytimg.com/vi/abc123XYZ90/mqdefault.jpg"
 	if status := got["https://youtu.be/abc123XYZ90"]; !status.HasArt || status.Path != want {
 		t.Errorf("got %+v, want HasArt=true, Path=%q", status, want)
 	}

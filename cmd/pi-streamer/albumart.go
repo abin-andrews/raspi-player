@@ -336,11 +336,15 @@ func (a *artAdapter) Query(urls []string) map[string]api.ArtStatus {
 		// shows its real thumbnail immediately rather than a placeholder
 		// until some later GET /api/albumart request happens to populate
 		// the cache. Query backs list views (Library/Queue/search results,
-		// batched via useAlbumArtStatus) showing many thumbnails at once,
-		// so this deliberately uses the smaller default.jpg — resolve's
-		// identical shortcut below uses the bigger hqdefault.jpg for the
-		// few places a single track's art is shown large.
-		if thumb, ok := ytdlp.DefaultThumbnailURL(u); ok {
+		// batched via useAlbumArtStatus) showing many thumbnails at once —
+		// this uses MediumThumbnailURL (320x180), not the smallest
+		// DefaultThumbnailURL (120x90): the latter visibly upscales/blurs
+		// once stretched to cover a ~120px tile (a real quality complaint,
+		// not just theoretical), where 320x180 stays sharp scaled down to
+		// that size. resolve's identical shortcut below uses the bigger
+		// hqdefault.jpg for the few places a single track's art is shown
+		// large.
+		if thumb, ok := ytdlp.MediumThumbnailURL(u); ok {
 			out[u] = api.ArtStatus{HasArt: true, Path: thumb}
 		}
 	}

@@ -183,6 +183,13 @@ internal/coverart/      Fetcher.Fetch(ctx, artist, album): MusicBrainz release s
                         policy); the Cover Art Archive fetch itself isn't throttled. Tested against
                         httptest fake servers only — never a live third-party call in this repo's tests.
                         See Architecture notes for how cmd/pi-streamer/albumart.go's artAdapter uses it.
+internal/audioinfo/      Prober.Probe(ctx, path): reads a local audio file's technical properties (codec,
+                        sample rate, channels, bit depth, bitrate, duration) by shelling out to ffprobe
+                        (part of the already-required ffmpeg package — never vendored/reimplemented, same
+                        pattern as internal/ytdlp). Only works against a local file path, not a remote
+                        URL — used by cmd/pi-streamer/bucket.go's bucketAdapter to enrich the Bucket tab's
+                        listing with real technical info about each cached file. Tested against a fake
+                        shell script standing in for ffprobe, never a real audio file/binary.
 internal/jobs/          Generic in-memory background job tracker (Manager.Start/List, a Handle for
                         SetTotal/Advance progress reporting) — panic-recovering goroutines, oldest-finished
                         pruning (never prunes a running job). Currently used only by the album art warm
@@ -389,11 +396,15 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   into a *separate*, non-evictable store capped by its own `Bucket.FavoritesMaxSizeMB`: "permanent" means it's
   never auto-deleted to make room for something else, not that it's unbounded — once full, saving a *new*
   favorite's audio just fails (logged, not surfaced to the caller) rather than evicting an existing one.
-  **Shared safety margin**: `Bucket.MinFreeMB` bounds *both* stores independently via `golang.org/x/sys/unix.
-  Statfs` on the store's directory (real disk free space, not just each store's own size accounting) — the
-  evictable cache will evict its own entries harder to protect the margin if needed; the non-evictable
-  favorites store simply refuses the download, same as hitting its own cap. All three size fields are
-  zero-defaultable (`config.DefaultBucketMaxSizeMB`/`DefaultFavoritesMaxSizeMB`/`DefaultMinFreeMB`, applied by
+  **The shared disk-space safety margin (`Bucket.MinFreeMB`) was removed** — both stores already have their
+  own independent size cap, and once both existed the extra margin (bounding free disk space via
+  `golang.org/x/sys/unix.Statfs`, on top of either cap) was judged redundant complexity rather than genuine
+  extra protection; removed from `internal/config.Bucket`, `internal/bucket.Store` (the `minFreeBytes` field,
+  `SetMinFree`, and the corresponding checks in `makeRoomLocked`), `internal/api.BucketStatus`'s
+  `MinFreeBytes` field, `validateBucket`'s validation, and the Settings tab's "Safety margin (MB)" input.
+  `bucket.Store.diskFree`/`Stats()`'s `DiskFreeBytes` stayed — informational free-disk-space reporting is
+  independently useful even with no enforced threshold behind it. The two remaining size fields are
+  zero-defaultable (`config.DefaultBucketMaxSizeMB`/`DefaultFavoritesMaxSizeMB`, applied by
   `configAdapter.applyBucket`, mirroring `applyOLED`'s baud-default pattern) and validated non-negative by
   `internal/api`'s `validateBucket` before `Set` ever persists them. **Prefetching**: the existing 1s
   playing-ticker in `main.go` also triggers `prefetchNext` once the current track has ≤15s left
@@ -418,6 +429,36 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   lists the playback cache's actual contents and lets you favorite/unfavorite a cached entry directly (reusing
   the existing `addFavorite`/`removeFavorite` calls — no bucket-specific favorite API), with a heart icon
   toggled by cross-referencing `GET /api/favorites` client-side.
+  **Manual per-entry removal, for testing**: `bucketAdapter.Remove` (`api.Bucket.Remove`,
+  `DELETE /api/bucket?url=`, `web/src/api.js`'s `removeBucketEntry`) just calls the playback cache's own
+  `bucket.Store.Remove(url)` directly — deliberately scoped to the playback cache only, never the favorites
+  archive (un-favoriting is the existing, separate way to clear something from there). `Bucket.jsx`'s
+  trash-icon button confirms via `window.confirm` first (same pattern as `Queue.jsx`'s `handleClear`), for
+  deliberately forcing a fresh re-download on next play/queue, or just freeing space on demand, without
+  waiting on LRU eviction.
+  **Rich listing data, for telling entries apart at a glance**: a bare URL + file size wasn't enough to
+  usefully pick "which one do I want to remove" out of a list, so `api.BucketEntry` grew two kinds of
+  best-effort enrichment, both computed in `bucketAdapter.List` (never persisted anywhere, always fresh per
+  request — this endpoint isn't polled, so recomputing on every call is fine): (1) **Title/Artist/Album**,
+  via a new `trackInfoLookup` interface (`TrackInfo(url) (title, artist, album string, err error)`) —
+  `*player.Player` already satisfies it (see `Player.TrackInfo`, added for the browser extension's
+  notifications — reused here rather than duplicating a second search-index lookup path); skipped
+  entirely for an entry with no `URL` (predates the bucket's own URL index) or no `trackInfo` configured.
+  (2) **Technical audio properties** — codec, sample rate, channel count, bit depth, bitrate, duration — via
+  a new package, `internal/audioinfo`: `Prober.Probe(ctx, path)` shells out to `ffprobe` (part of the
+  `ffmpeg` package this project already requires — see `internal/ytdlp`'s identical shell-out-to-an-
+  already-installed-CLI pattern, never vendored/reimplemented) against the *cached file itself* on disk,
+  parsing its JSON `-show_format -show_streams` output. This only works against a local file, unlike
+  `internal/metadata`'s ranged-HTTP-GET tag reading — exactly what `bucket.Store`'s cached copies are.
+  `bucket.Entry` grew a `Filename` field (the entry's actual on-disk name) specifically so callers like this
+  one can resolve a full path via `Store.FilePath` to probe at all; `List()` never had a reason to expose
+  the filename before this. True VBR-vs-CBR detection was considered and left out: ffprobe's summary output
+  doesn't reliably distinguish them without per-frame analysis, so this reports the plain bitrate figure
+  (already the useful, verifiable number for "good for testing purposes") rather than fabricate a
+  confidence-lacking boolean. Both probing and the trackInfo lookup are best-effort per entry — a failure on
+  either one only leaves that entry's corresponding fields zero-valued, never fails the whole listing.
+  `Bucket.jsx`'s `formatAudioInfo` renders these as a compact "MP3 · 320 kbps · 44.1 kHz · 2ch" badge per
+  row.
   **`player.Resolver.Unresolve` — mpd only ever sees the resolved URI, never the original**: confirmed by
   direct testing (see below) that a bucket-mode-resolved local file-server URL, once handed to mpd, becomes
   what mpd itself reports back through `Queue()`/`Status()` — so without reversing it, the Queue tab would show
@@ -527,15 +568,19 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   first in both) still wins over this, same as ever. `ThumbnailFetcher` itself, now fully unused, was deleted
   outright, along with its tests — see `internal/ytdlp/ytdlp.go`'s history if the byte-fetching approach is
   ever needed again (e.g. to also mirror the image for an offline/no-egress deployment).
-  **Two different thumbnail sizes for two different contexts** — `resolve` actually uses
-  `ytdlp.HQThumbnailURL` (480×360) while `Query` uses `ytdlp.DefaultThumbnailURL` (120×90, YouTube's
-  smallest generated size, same "exists for every video" guarantee as hqdefault): `Query` backs *list*
-  views (Library/Queue/search results, batched via `useAlbumArtStatus`) showing many thumbnails at once,
-  where the smaller size means less bandwidth/faster loading for something displayed small anyway;
-  `resolve` (via `GET /api/albumart`, i.e. `albumArtUrl()`) backs the few places a *single* track's art is
-  shown large — the "now playing" view (`PlayerBar`'s mini art, `NowPlayingScreen`'s big art) and the
-  Library track detail page, both of which call `albumArtUrl`/hit `TrackArt`'s no-batched-query fallback
-  path directly rather than going through `Query` at all.
+  **Two different thumbnail sizes for two different contexts** — `resolve` uses `ytdlp.HQThumbnailURL`
+  (480×360) while `Query` uses `ytdlp.MediumThumbnailURL` (320×180): `Query` backs *list* views (Library/
+  Queue/search results, batched via `useAlbumArtStatus`) showing many thumbnails at once, `resolve` (via
+  `GET /api/albumart`, i.e. `albumArtUrl()`) backs the few places a *single* track's art is shown large —
+  the "now playing" view (`PlayerBar`'s mini art, `NowPlayingScreen`'s big art) and the Library track detail
+  page, both of which call `albumArtUrl`/hit `TrackArt`'s no-batched-query fallback path directly rather
+  than going through `Query` at all. **`Query` tried `ytdlp.DefaultThumbnailURL` (120×90, YouTube's
+  smallest size) first** — reported and confirmed as a real quality problem, not just a theoretical one:
+  `object-fit: cover` on a ~120px-square tile scales a 120×90 source's shorter dimension *up* to fill the
+  box before cropping, i.e. upscaling a source that's already exactly tile-sized, which visibly blurs.
+  320×180 covers the same tile by scaling *down*, staying sharp — still far lighter than 480×360 for a
+  screen showing many at once. `DefaultThumbnailURL` itself is kept (a tested, still-valid public helper for
+  anything that genuinely wants the smallest possible thumbnail), just no longer what `Query` calls.
   **Title: YouTube's oEmbed endpoint, independent of extraction/embedding** (`TitleFetcher`, wired into
   `metadataAdapter.Fetch` in `cmd/pi-streamer/metadata.go`) — `--embed-metadata` (above) already gets a real
   title onto the *extracted audio file* for mpd's own tag-reading to pick up once the track is actually
@@ -781,6 +826,15 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   it), so the footer height dropped from 132px to 80px to match. `keepMounted={false}` is preserved exactly
   as before (see the browser-memory note below) on the now-2-tab `Tabs` — the underlying "don't leave an
   inactive tab's effects/timers running" reasoning is unchanged, just for fewer tabs.
+  **Tab content's `Container` widened for large screens**: `App.jsx`'s `<Container size="sm">` wrapping
+  `Tabs.Panel`s (Library/Queue) capped content at 720px regardless of viewport width — on a desktop/laptop
+  monitor this left large, genuinely wasted side margins, reported directly as such. Bumped to `size="xl"`
+  (Mantine's largest built-in token, 1320px) — still just as narrow as before on a phone (`Container` is
+  responsive; the `size` prop is only ever a *maximum*), but actually uses a wide screen's space instead of
+  floating a fixed-width column in the middle of it. Library's grid view (`SimpleGrid`) picked up matching
+  larger-breakpoint column counts (`cols={{ base: 2, sm: 3, md: 4, lg: 5, xl: 6 }}`, up from capping at 4)
+  so a wider container also means more tiles per row, not just bigger gutters. Settings isn't affected —
+  it's a separate full-screen `Modal`, not nested inside this `Container` at all.
 - **Full-screen Now Playing view** (`web/src/components/NowPlayingScreen.jsx`, `web/src/hooks/
   usePlayerControls.js`) — `PlayerBar`'s mini bar is deliberately compact (art/title/artist truncated to
   fit a 80px footer), which is fine for "what's playing at a glance" but not for actually looking at the

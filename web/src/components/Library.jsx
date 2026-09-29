@@ -439,7 +439,7 @@ function Library({ status }) {
       )
     }
     return effectiveViewMode === 'grid' ? (
-      <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="xs">
+      <SimpleGrid cols={{ base: 2, sm: 3, md: 4, lg: 5, xl: 6 }} spacing="xs">
         {list.map(renderEntry)}
       </SimpleGrid>
     ) : (
@@ -588,7 +588,7 @@ function Library({ status }) {
           </Text>
         )}
         {effectiveViewMode === 'grid' ? (
-          <SimpleGrid cols={{ base: 2, sm: 3, md: 4 }} spacing="xs">
+          <SimpleGrid cols={{ base: 2, sm: 3, md: 4, lg: 5, xl: 6 }} spacing="xs">
             {groups.map(([name, list]) => (
               <Card
                 key={name}

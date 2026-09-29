@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"pi-streamer/internal/api"
+	"pi-streamer/internal/audioinfo"
 	"pi-streamer/internal/bucket"
 	"pi-streamer/internal/config"
 	"pi-streamer/internal/mpdclient"
@@ -179,12 +180,36 @@ func (a *favoriteArchiver) Forget(url string) {
 	}
 }
 
+// trackInfoLookup is the narrow slice of *player.Player's behavior
+// bucketAdapter needs, to enrich List's results with title/artist/album —
+// matches the "package defines the interface it needs" pattern used
+// throughout this codebase.
+type trackInfoLookup interface {
+	TrackInfo(url string) (title, artist, album string, err error)
+}
+
+// audioProber is the narrow slice of *audioinfo.Prober's behavior
+// bucketAdapter needs.
+type audioProber interface {
+	Probe(ctx context.Context, path string) (audioinfo.Info, error)
+}
+
+// probeTimeout bounds one file's ffprobe call within List — generous for
+// a local-disk read (no network involved at all), but still finite so a
+// truly stuck subprocess can't hang the whole listing.
+const probeTimeout = 5 * time.Second
+
 // bucketAdapter implements internal/api.Bucket, exposing both the playback
 // cache's and the favorites archive's usage in one status payload.
+// trackInfo/prober are both nil-able (matching Indexer/MetadataFetcher
+// elsewhere in this codebase) — List simply skips the corresponding
+// enrichment if either isn't configured, rather than erroring.
 type bucketAdapter struct {
 	cfg       *config.Store
 	cache     *bucket.Store
 	favorites *bucket.Store
+	trackInfo trackInfoLookup
+	prober    audioProber
 }
 
 func (b *bucketAdapter) Status() api.BucketStatus {
@@ -202,10 +227,6 @@ func (b *bucketAdapter) Status() api.BucketStatus {
 	if mode == "" {
 		mode = config.ModeStream
 	}
-	minFreeMB := cfg.Bucket.MinFreeMB
-	if minFreeMB == 0 {
-		minFreeMB = config.DefaultMinFreeMB
-	}
 
 	return api.BucketStatus{
 		Mode:               string(mode),
@@ -214,7 +235,6 @@ func (b *bucketAdapter) Status() api.BucketStatus {
 		FavoritesUsedBytes: favUsed,
 		FavoritesMaxBytes:  favMax,
 		DiskFreeBytes:      diskFree,
-		MinFreeBytes:       int64(minFreeMB) * 1024 * 1024,
 	}
 }
 
@@ -231,6 +251,11 @@ func (b *bucketAdapter) Query(urls []string) map[string]bool {
 // List implements internal/api.Bucket — the evictable playback cache only
 // (not the favorites archive, which is already browsable via the app's own
 // GET /api/favorites/internal/store, keyed by title rather than raw URL).
+// Enriches each entry with title/artist/album (from the search index, via
+// trackInfo) and technical audio properties (probed directly from the
+// cached file on disk, via prober) — both best-effort, so a lookup/probe
+// failure for one entry never fails the whole listing, it just leaves
+// those fields zero-valued on that entry.
 func (b *bucketAdapter) List() ([]api.BucketEntry, error) {
 	entries, err := b.cache.List()
 	if err != nil {
@@ -238,9 +263,40 @@ func (b *bucketAdapter) List() ([]api.BucketEntry, error) {
 	}
 	out := make([]api.BucketEntry, len(entries))
 	for i, e := range entries {
-		out[i] = api.BucketEntry{URL: e.URL, SizeBytes: e.SizeBytes, LastAccessed: e.LastAccessed}
+		entry := api.BucketEntry{URL: e.URL, SizeBytes: e.SizeBytes, LastAccessed: e.LastAccessed}
+
+		if e.URL != "" && b.trackInfo != nil {
+			if title, artist, album, err := b.trackInfo.TrackInfo(e.URL); err == nil {
+				entry.Title, entry.Artist, entry.Album = title, artist, album
+			}
+		}
+
+		if b.prober != nil && e.Filename != "" {
+			if path, ok := b.cache.FilePath(e.Filename); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+				info, probeErr := b.prober.Probe(ctx, path)
+				cancel()
+				if probeErr == nil {
+					entry.Codec = info.Codec
+					entry.SampleRateHz = info.SampleRateHz
+					entry.Channels = info.Channels
+					entry.BitsPerSample = info.BitsPerSample
+					entry.BitrateKbps = info.BitrateKbps
+					entry.DurationSeconds = info.DurationSeconds
+				}
+			}
+		}
+
+		out[i] = entry
 	}
 	return out, nil
+}
+
+// Remove implements internal/api.Bucket — deletes one entry from the
+// playback cache only. See the interface's own doc comment for why the
+// favorites archive is deliberately out of scope here.
+func (b *bucketAdapter) Remove(url string) error {
+	return b.cache.Remove(url)
 }
 
 // Downloads implements internal/api.Bucket — every in-flight download

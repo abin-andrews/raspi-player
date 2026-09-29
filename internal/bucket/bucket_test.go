@@ -432,56 +432,6 @@ func TestNonEvictableStoreRefusesInsteadOfDeleting(t *testing.T) {
 	}
 }
 
-func TestMinFreeMarginEvictsOnEvictableStore(t *testing.T) {
-	dir := t.TempDir()
-	s, err := Open(dir, 0, true) // no size cap, only the margin constrains it
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	// Fake a filesystem with only 15 bytes free, regardless of what's
-	// actually free on the machine running this test.
-	var free int64 = 15
-	s.diskFree = func(string) (int64, error) { return free, nil }
-	s.SetMinFree(10) // must always leave >= 10 bytes free
-
-	srvA := newServer(t, "aaaaaaaaaa") // 10 bytes: 15-10=5 < margin 10 -> must evict, but nothing to evict yet, so this must fail
-	if _, err := s.Download(context.Background(), srvA.URL); err == nil {
-		t.Fatal("Download A: want an error — 15 free - 10 bytes leaves only 5, below the 10-byte margin, and there's nothing yet to evict")
-	}
-}
-
-func TestMinFreeMarginAllowsWhenSpaceAvailable(t *testing.T) {
-	dir := t.TempDir()
-	s, err := Open(dir, 0, true)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	var free int64 = 1000
-	s.diskFree = func(string) (int64, error) { return free, nil }
-	s.SetMinFree(10)
-
-	srv := newServer(t, "aaaaaaaaaa") // 10 bytes: 1000-10=990 >= margin 10 -> fine
-	if _, err := s.Download(context.Background(), srv.URL); err != nil {
-		t.Fatalf("Download: %v, want it to succeed with plenty of free space", err)
-	}
-}
-
-func TestMinFreeMarginRefusesOnNonEvictableStore(t *testing.T) {
-	dir := t.TempDir()
-	s, err := Open(dir, 0, false) // permanent favorites archive
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	var free int64 = 15
-	s.diskFree = func(string) (int64, error) { return free, nil }
-	s.SetMinFree(10)
-
-	srv := newServer(t, "aaaaaaaaaa") // 10 bytes: would leave only 5 free, below the margin
-	if _, err := s.Download(context.Background(), srv.URL); err == nil {
-		t.Error("Download: want an error — saving this would violate the safety margin, and a permanent store can't evict anything to fix that")
-	}
-}
-
 func TestStats(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir, 100, true)

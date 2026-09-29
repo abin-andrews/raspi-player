@@ -183,10 +183,9 @@ func (a *configAdapter) applyOLED(cfg config.Config) {
 	updateOLEDTrack(a.oled, status)
 }
 
-// applyBucket pushes the configured size caps/safety margin into both the
-// playback cache and the favorites archive live — SetMaxSize/SetMinFree
-// don't evict anything themselves; a lowered cap just takes effect on the
-// bucket's next Download.
+// applyBucket pushes the configured size caps into both the playback cache
+// and the favorites archive live — SetMaxSize doesn't evict anything
+// itself; a lowered cap just takes effect on the bucket's next Download.
 func (a *configAdapter) applyBucket(cfg config.Config) {
 	bucketMaxMB := cfg.Bucket.MaxSizeMB
 	if bucketMaxMB == 0 {
@@ -196,16 +195,10 @@ func (a *configAdapter) applyBucket(cfg config.Config) {
 	if favMaxMB == 0 {
 		favMaxMB = config.DefaultFavoritesMaxSizeMB
 	}
-	minFreeMB := cfg.Bucket.MinFreeMB
-	if minFreeMB == 0 {
-		minFreeMB = config.DefaultMinFreeMB
-	}
 
 	const mb = 1024 * 1024
 	a.cache.SetMaxSize(int64(bucketMaxMB) * mb)
-	a.cache.SetMinFree(int64(minFreeMB) * mb)
 	a.favorites.SetMaxSize(int64(favMaxMB) * mb)
-	a.favorites.SetMinFree(int64(minFreeMB) * mb)
 }
 
 // oledState maps mpd's player state to arduino/control.ino's STATE enum.

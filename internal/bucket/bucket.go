@@ -5,11 +5,6 @@
 // size cap, but never self-evicts: a full favorites archive just refuses
 // new downloads rather than deleting an existing "permanent" one) — both
 // are the same type, just opened with evictable=false for favorites.
-//
-// Both kinds also respect a shared safety margin (minFreeBytes): a download
-// is refused if it would leave the underlying filesystem with less free
-// space than that, even if the store's own size cap isn't reached yet —
-// this is what keeps the SD card itself from ever being filled solid.
 package bucket
 
 import (
@@ -41,13 +36,12 @@ const indexFileName = ".index.json"
 
 // Store is a directory of cached files, safe for concurrent use.
 type Store struct {
-	mu           sync.Mutex
-	dir          string
-	maxSize      int64 // bytes; <= 0 means uncapped
-	minFreeBytes int64 // safety margin; <= 0 disables the check
-	evictable    bool  // false for the permanent favorites archive
-	diskFree     func(dir string) (int64, error)
-	urls         map[string]string // filename -> source URL
+	mu        sync.Mutex
+	dir       string
+	maxSize   int64 // bytes; <= 0 means uncapped
+	evictable bool  // false for the permanent favorites archive
+	diskFree  func(dir string) (int64, error)
+	urls      map[string]string // filename -> source URL
 
 	progressMu sync.Mutex
 	progress   map[string]*downloadProgress // url -> in-flight download, while Download runs
@@ -155,13 +149,6 @@ func (s *Store) SetMaxSize(maxSize int64) {
 	s.maxSize = maxSize
 }
 
-// SetMinFree changes the safety margin live, same as SetMaxSize.
-func (s *Store) SetMinFree(minFreeBytes int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.minFreeBytes = minFreeBytes
-}
-
 // hashFor is url's content-addressed identity, shared by keyFor (which
 // adds a URL-guessed extension) and DownloadVia (which instead preserves
 // the extension of whatever file its fetch callback actually produced).
@@ -266,9 +253,9 @@ func (s *Store) Lookup(url string) (path string, ok bool) {
 // Download fetches url into the cache and returns the local path. It
 // streams to a temp file and renames atomically at the end, so a
 // concurrent Lookup/Contains never sees a half-written file. Before
-// finalizing, it makes room within the store's size cap and the shared
-// disk-space safety margin — evicting its own least-recently-used entries
-// first if evictable, or simply refusing with an error if not (see Open).
+// finalizing, it makes room within the store's size cap — evicting its own
+// least-recently-used entries first if evictable, or simply refusing with
+// an error if not (see Open).
 func (s *Store) Download(ctx context.Context, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -341,8 +328,8 @@ func (s *Store) Download(ctx context.Context, url string) (string, error) {
 // new file *inside* dir (the exact path is fetch's choice, e.g. via
 // os.CreateTemp(dir, ...) or a tool's own output flag pointed into dir)
 // and return that path — DownloadVia takes it from there: sizing it,
-// making room within the size cap and safety margin (see
-// makeRoomLocked), and atomically renaming it into place under url's
+// making room within the size cap (see makeRoomLocked), and atomically
+// renaming it into place under url's
 // content-addressed name, exactly as Download does after its own HTTP
 // GET. fetch's output file's own extension (whatever it actually wrote,
 // e.g. ".m4a"/".opus") is preserved on the final name — unlike Download's
@@ -390,11 +377,11 @@ func (s *Store) DownloadVia(ctx context.Context, url string, fetch func(dir stri
 }
 
 // makeRoomLocked ensures there's room for an incoming file of the given
-// size, within both this store's own size cap and the shared free-disk-
-// space margin. If evictable, it deletes this store's own
-// least-recently-used entries (oldest mtime first) to get there; if not
-// (the permanent favorites archive), it never deletes anything — it either
-// already fits or the download is refused. Called with s.mu held.
+// size, within this store's own size cap. If evictable, it deletes this
+// store's own least-recently-used entries (oldest mtime first) to get
+// there; if not (the permanent favorites archive), it never deletes
+// anything — it either already fits or the download is refused. Called
+// with s.mu held.
 func (s *Store) makeRoomLocked(incoming int64, keep string) error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -425,22 +412,8 @@ func (s *Store) makeRoomLocked(incoming int64, keep string) error {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].mtime.Before(items[j].mtime) })
 
-	var free int64
-	if s.minFreeBytes > 0 {
-		free, err = s.diskFree(s.dir)
-		if err != nil {
-			return fmt.Errorf("check free disk space: %w", err)
-		}
-	}
-
 	needsRoom := func() bool {
-		if s.maxSize > 0 && total+incoming > s.maxSize {
-			return true
-		}
-		if s.minFreeBytes > 0 && free-incoming < s.minFreeBytes {
-			return true
-		}
-		return false
+		return s.maxSize > 0 && total+incoming > s.maxSize
 	}
 
 	evicted := false
@@ -452,7 +425,6 @@ func (s *Store) makeRoomLocked(incoming int64, keep string) error {
 				continue
 			}
 			total -= it.size
-			free += it.size // freeing a file gives that space back to the filesystem
 			delete(s.urls, filepath.Base(it.path))
 			evicted = true
 		}
@@ -462,7 +434,7 @@ func (s *Store) makeRoomLocked(incoming int64, keep string) error {
 	}
 
 	if needsRoom() {
-		return fmt.Errorf("not enough space for a %d-byte file within the configured limits", incoming)
+		return fmt.Errorf("not enough space for a %d-byte file within the configured size limit", incoming)
 	}
 	return nil
 }
@@ -512,11 +484,15 @@ func realDiskFree(dir string) (int64, error) {
 
 // Entry describes one cached file, for List. URL is empty if this entry
 // predates the index (or the index was lost) — the filename alone can't be
-// reversed back into it.
+// reversed back into it. Filename is the entry's actual on-disk name
+// (content-hash-based, see keyFor/DownloadVia) — resolvable back to a full
+// path via FilePath, e.g. for a caller that wants to probe the file itself
+// (internal/audioinfo) rather than just report its size/URL.
 type Entry struct {
 	URL          string
 	SizeBytes    int64
 	LastAccessed time.Time
+	Filename     string
 }
 
 // List returns every currently cached entry, most-recently-accessed first
@@ -542,6 +518,7 @@ func (s *Store) List() ([]Entry, error) {
 			URL:          s.urls[e.Name()],
 			SizeBytes:    info.Size(),
 			LastAccessed: info.ModTime(),
+			Filename:     e.Name(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].LastAccessed.After(out[j].LastAccessed) })
