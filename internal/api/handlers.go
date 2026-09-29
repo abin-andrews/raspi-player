@@ -28,6 +28,24 @@ func decodeJSON(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
+// discoveryResponse is what GET /api/discover answers with — deliberately
+// static and dependency-free (no Player/mpd involved at all), so a client
+// scanning the LAN for this daemon gets an instant, always-available
+// positive identification rather than tripping over whatever transient
+// state Status()/mpd happen to be in. Service/Version let a client (the
+// browser extension in extension/) tell "this is actually pi-streamer,"
+// not just "something answered on this port" — matters once a scan is
+// probing arbitrary addresses that might be running an unrelated HTTP
+// server. Version is this response shape's own version, not the app's.
+type discoveryResponse struct {
+	Service string `json:"service"`
+	Version int    `json:"version"`
+}
+
+func handleDiscover(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, discoveryResponse{Service: "pi-streamer", Version: 1})
+}
+
 func handlePlay(p Player) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -551,6 +569,33 @@ func handleSearch(p Player) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, results)
+	}
+}
+
+// trackInfoResponse is GET /api/track's response shape — a plain
+// title/artist/album description of a URL, on demand, for a caller (the
+// browser extension in extension/, in particular) that already submitted
+// the URL via /api/play or /api/queue and wants to describe what it just
+// sent, e.g. in a notification.
+type trackInfoResponse struct {
+	Title  string `json:"title"`
+	Artist string `json:"artist,omitempty"`
+	Album  string `json:"album,omitempty"`
+}
+
+func handleTrackInfo(p Player) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		url := r.URL.Query().Get("url")
+		if url == "" {
+			writeError(w, http.StatusBadRequest, errors.New("missing url query parameter"))
+			return
+		}
+		title, artist, album, err := p.TrackInfo(url)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, trackInfoResponse{Title: title, Artist: artist, Album: album})
 	}
 }
 

@@ -421,6 +421,48 @@ func TestLibraryWithoutIndexerErrors(t *testing.T) {
 	}
 }
 
+func TestTrackInfoReturnsIndexedMetadata(t *testing.T) {
+	p, idx := newTestPlayerWithIndexer()
+	idx.indexed = []indexer.Result{
+		{URL: "http://example.com/a.mp3", Title: "Dreams", Artist: "Fleetwood Mac", Album: "Rumours"},
+	}
+
+	title, artist, album, err := p.TrackInfo("http://example.com/a.mp3")
+	if err != nil {
+		t.Fatalf("TrackInfo: %v", err)
+	}
+	if title != "Dreams" || artist != "Fleetwood Mac" || album != "Rumours" {
+		t.Errorf("got (%q, %q, %q), want (Dreams, Fleetwood Mac, Rumours)", title, artist, album)
+	}
+}
+
+func TestTrackInfoFallsBackToDerivedTitleWhenUnindexed(t *testing.T) {
+	p, _ := newTestPlayerWithIndexer()
+
+	title, artist, album, err := p.TrackInfo("http://example.com/My-Song.mp3")
+	if err != nil {
+		t.Fatalf("TrackInfo: %v", err)
+	}
+	if title != "My Song" {
+		t.Errorf("title = %q, want %q", title, "My Song")
+	}
+	if artist != "" || album != "" {
+		t.Errorf("artist/album = %q/%q, want both empty", artist, album)
+	}
+}
+
+func TestTrackInfoWithoutIndexerStillDerivesTitle(t *testing.T) {
+	p := New(mpdclient.NewFakeClient(), store.NewMemoryStore(), nil, nil, nil, nil)
+
+	title, _, _, err := p.TrackInfo("http://example.com/My-Song.mp3")
+	if err != nil {
+		t.Fatalf("TrackInfo: %v", err)
+	}
+	if title != "My Song" {
+		t.Errorf("title = %q, want %q", title, "My Song")
+	}
+}
+
 func TestAddToLibrary(t *testing.T) {
 	p, idx := newTestPlayerWithIndexer()
 

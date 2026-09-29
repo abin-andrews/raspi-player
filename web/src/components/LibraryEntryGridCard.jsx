@@ -23,6 +23,7 @@ const ART_SIZE = 120
 function LibraryEntryGridCard({
   entry,
   isPlaying,
+  isPending,
   isFavorite,
   artStatus,
   onPlay,
@@ -70,6 +71,7 @@ function LibraryEntryGridCard({
                 variant="filled"
                 color="dark"
                 size="sm"
+                loading={isPending}
                 style={{ position: 'absolute', top: 4, right: 4 }}
                 aria-label="Actions"
               >

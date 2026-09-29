@@ -151,12 +151,11 @@ func main() {
 	// required), unlike the OLED/bucket-mode pieces above which are
 	// genuinely optional accessories.
 	artAPI := &artAdapter{
-		mpd:        mpdConn,
-		coverArt:   &coverart.Fetcher{},
-		thumbnails: &ytdlp.ThumbnailFetcher{},
-		library:    p,
-		store:      artStore,
-		jobs:       jobsMgr,
+		mpd:      mpdConn,
+		coverArt: &coverart.Fetcher{},
+		library:  p,
+		store:    artStore,
+		jobs:     jobsMgr,
 	}
 
 	// broadcastStatus fetches the current mpd status and pushes it to every

@@ -49,6 +49,10 @@ type Player interface {
 	// RemoveFromLibrary deletes url from the search index only — see
 	// player.Player.RemoveFromLibrary's doc comment.
 	RemoveFromLibrary(url string) error
+	// TrackInfo reports the best available title/artist/album for url
+	// on demand, without playing or queuing it — see
+	// player.Player.TrackInfo's doc comment.
+	TrackInfo(url string) (title, artist, album string, err error)
 
 	Queue() ([]mpdclient.QueueTrack, error)
 	AddToQueue(url string) error
@@ -227,6 +231,7 @@ type Jobs interface {
 func NewRouter(p Player, cfg Config, o Oled, b Bucket, art Art, j Jobs) http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /api/discover", handleDiscover)
 	mux.HandleFunc("POST /api/play", handlePlay(p))
 	mux.HandleFunc("POST /api/pause", handlePause(p))
 	mux.HandleFunc("POST /api/resume", handleResume(p))
@@ -258,6 +263,7 @@ func NewRouter(p Player, cfg Config, o Oled, b Bucket, art Art, j Jobs) http.Han
 
 	mux.HandleFunc("GET /api/search", handleSearch(p))
 	mux.HandleFunc("GET /api/library", handleLibrary(p))
+	mux.HandleFunc("GET /api/track", handleTrackInfo(p))
 	mux.HandleFunc("POST /api/library", handleAddToLibrary(p))
 	mux.HandleFunc("DELETE /api/library", handleRemoveFromLibrary(p))
 

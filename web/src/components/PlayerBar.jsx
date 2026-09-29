@@ -31,6 +31,7 @@ function PlayerBar({ status, onExpand, hideVolumeControl }) {
     canSeek,
     elapsed,
     isPlaying,
+    playPausePending,
     volume,
     primaryLine,
     setDragValue,
@@ -112,6 +113,7 @@ function PlayerBar({ status, onExpand, hideVolumeControl }) {
             variant="filled"
             radius="xl"
             size="lg"
+            loading={playPausePending}
             onClick={handlePlayPause}
             aria-label={isPlaying ? 'Pause' : 'Play'}
           >

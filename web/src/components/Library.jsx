@@ -183,6 +183,14 @@ function Library({ status }) {
 
   const [favorites, setFavorites] = useState([])
   const [error, setError] = useState(null)
+  // Tracks which single URL's Play request is currently in flight, so the
+  // exact row/card/detail-page button that was clicked can show a spinner
+  // instead of its Play icon — a fresh PlayURL can take a real, visible
+  // while to respond for a YouTube link (the daemon extracts its audio via
+  // yt-dlp before mpd ever starts playing — see CLAUDE.md's YouTube-URL
+  // architecture note), so without this the button just looks unresponsive
+  // for however long that takes.
+  const [pendingPlayUrl, setPendingPlayUrl] = useState(null)
 
   const listAndGridEnabled = subView === 'tracks' || subView === 'albums' || subView === 'artists'
   const effectiveViewMode = listAndGridEnabled ? viewMode : 'list'
@@ -345,10 +353,13 @@ function Library({ status }) {
 
   async function handlePlay(url) {
     setError(null)
+    setPendingPlayUrl(url)
     try {
       await playURL(url)
     } catch (err) {
       setError(err.message)
+    } finally {
+      setPendingPlayUrl(null)
     }
   }
 
@@ -380,11 +391,13 @@ function Library({ status }) {
   function renderEntry(entry) {
     const isPlaying = Boolean(status?.song) && entry.url === status.song
     const isFavorite = favoriteUrls.has(entry.url)
+    const isPending = pendingPlayUrl === entry.url
     return effectiveViewMode === 'grid' ? (
       <LibraryEntryGridCard
         key={entry.url}
         entry={entry}
         isPlaying={isPlaying}
+        isPending={isPending}
         isFavorite={isFavorite}
         artStatus={artStatus[entry.url]}
         onPlay={handlePlay}
@@ -402,6 +415,7 @@ function Library({ status }) {
         key={entry.url}
         entry={entry}
         isPlaying={isPlaying}
+        isPending={isPending}
         isFavorite={isFavorite}
         cached={cached[entry.url]}
         onPlay={handlePlay}
@@ -504,7 +518,11 @@ function Library({ status }) {
           </Stack>
         </Group>
         <Group>
-          <Button leftSection={<IconPlayerPlay size={16} />} onClick={() => handlePlay(entry.url)}>
+          <Button
+            leftSection={<IconPlayerPlay size={16} />}
+            loading={pendingPlayUrl === entry.url}
+            onClick={() => handlePlay(entry.url)}
+          >
             Play
           </Button>
           <Button

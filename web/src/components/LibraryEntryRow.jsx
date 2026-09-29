@@ -23,6 +23,7 @@ import { isYouTubeUrl } from '../isYouTubeUrl.js'
 function LibraryEntryRow({
   entry,
   isPlaying,
+  isPending,
   isFavorite,
   cached,
   onPlay,
@@ -115,7 +116,12 @@ function LibraryEntryRow({
           )}
         </Stack>
         <Group gap={4} wrap="nowrap">
-          <ActionIcon variant="light" onClick={() => onPlay(entry.url)} aria-label="Play">
+          <ActionIcon
+            variant="light"
+            loading={isPending}
+            onClick={() => onPlay(entry.url)}
+            aria-label="Play"
+          >
             <IconPlayerPlay size={16} />
           </ActionIcon>
           <ActionIcon

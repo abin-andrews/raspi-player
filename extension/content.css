@@ -1,0 +1,58 @@
+/* Overlay buttons injected by content.js onto YouTube video thumbnails. */
+
+.pi-streamer-container {
+  position: relative !important;
+}
+
+.pi-streamer-overlay {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  z-index: 2147483647;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.pi-streamer-container:hover .pi-streamer-overlay {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.pi-streamer-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.1s ease, background-color 0.15s ease;
+}
+
+.pi-streamer-btn:hover {
+  transform: scale(1.15);
+  background: #1c7ed6;
+}
+
+.pi-streamer-btn.pi-streamer-pending {
+  opacity: 0.6;
+  cursor: wait;
+  transform: none;
+}
+
+.pi-streamer-btn.pi-streamer-ok {
+  background: #2f9e44;
+}
+
+.pi-streamer-btn.pi-streamer-err {
+  background: #e03131;
+}

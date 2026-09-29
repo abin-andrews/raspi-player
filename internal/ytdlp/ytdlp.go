@@ -105,7 +105,10 @@ func ThumbnailURL(youtubeURL string) (string, bool) {
 // HQThumbnailURL returns the URL of youtubeURL's "high quality" (480x360)
 // thumbnail — the fallback for ThumbnailURL's maxresdefault.jpg, which
 // YouTube generates for every video without exception, unlike the
-// higher-resolution one.
+// higher-resolution one. Used for a single, prominently-displayed track
+// (the "now playing" view, a track's own detail page) — see
+// DefaultThumbnailURL for the smaller size used everywhere a list of many
+// thumbnails is shown at once.
 func HQThumbnailURL(youtubeURL string) (string, bool) {
 	id, ok := VideoID(youtubeURL)
 	if !ok {
@@ -114,76 +117,20 @@ func HQThumbnailURL(youtubeURL string) (string, bool) {
 	return "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg", true
 }
 
-// ThumbnailFetcher fetches a YouTube video's thumbnail image directly
-// from YouTube's own static image host — a plain HTTP GET, no yt-dlp
-// subprocess or API call needed at all, since thumbnail URLs are fully
-// predictable from the video ID alone (see ThumbnailURL/HQThumbnailURL).
-type ThumbnailFetcher struct {
-	httpClient *http.Client
-	// baseURL overrides https://i.ytimg.com — for tests only; leave
-	// zero-valued in production.
-	baseURL string
-}
-
-func (f *ThumbnailFetcher) client() *http.Client {
-	if f.httpClient != nil {
-		return f.httpClient
-	}
-	return http.DefaultClient
-}
-
-func (f *ThumbnailFetcher) base() string {
-	if f.baseURL != "" {
-		return f.baseURL
-	}
-	return "https://i.ytimg.com"
-}
-
-// Fetch returns youtubeURL's thumbnail image bytes, trying the
-// highest-resolution one first (maxresdefault.jpg) and falling back to
-// the guaranteed-to-exist "hq" size (hqdefault.jpg, 480x360) if that one
-// isn't available at all — not every video has a maxres thumbnail
-// generated (older or lower-resolution uploads, in particular), and any
-// failure fetching it (a 404, or a genuine network error) is treated the
-// same way: fall through to the hq attempt rather than giving up.
-// Returns (nil, nil), not an error, if youtubeURL doesn't identify a
-// single video at all (VideoID found nothing to build a thumbnail URL
-// from) — the same "confirmed no art" outcome Resolve/Refresh already
-// model for mpd's own AlbumArt lookup, not a failure worth surfacing.
-func (f *ThumbnailFetcher) Fetch(ctx context.Context, youtubeURL string) ([]byte, error) {
+// DefaultThumbnailURL returns the URL of youtubeURL's smallest generated
+// thumbnail (120x90, YouTube's "default" size — generated for every video
+// without exception, the same guarantee HQThumbnailURL has for its own
+// size). Deliberately preferred over the larger sizes for a *list* of many
+// thumbnails at once (the Library/Queue/search-results views) — smaller
+// images there mean less bandwidth and faster loading for something shown
+// at a small size anyway; HQThumbnailURL is for the few places a single
+// track's art is shown large.
+func DefaultThumbnailURL(youtubeURL string) (string, bool) {
 	id, ok := VideoID(youtubeURL)
 	if !ok {
-		return nil, nil
+		return "", false
 	}
-	if data, err := f.fetchImage(ctx, id, "maxresdefault"); err == nil && len(data) > 0 {
-		return data, nil
-	}
-	return f.fetchImage(ctx, id, "hqdefault")
-}
-
-func (f *ThumbnailFetcher) fetchImage(ctx context.Context, videoID, size string) ([]byte, error) {
-	imgURL := f.base() + "/vi/" + videoID + "/" + size + ".jpg"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imgURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("ytdlp: build thumbnail request: %w", err)
-	}
-	resp, err := f.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("ytdlp: thumbnail request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil // this size isn't generated for this video — not an error
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("ytdlp: thumbnail fetch: status %d: %s", resp.StatusCode, string(body))
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("ytdlp: read thumbnail response: %w", err)
-	}
-	return data, nil
+	return "https://i.ytimg.com/vi/" + id + "/default.jpg", true
 }
 
 // TitleFetcher fetches a YouTube video's title via YouTube's own oEmbed

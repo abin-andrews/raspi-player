@@ -230,6 +230,18 @@ func (p *Player) enrichMetadata(url, fallbackTitle string) {
 		title = fallbackTitle
 	}
 	_ = p.indexer.IndexURL(url, title, artist, album, "")
+	// lookupEnrichment's very first call for url (typically Status/Queue's
+	// first poll right after PlayURL/AddToQueue returns) races this
+	// goroutine: if it wins, it caches indexAsync's thin, title-less
+	// IndexURL as "resolved" before this enrichment ever lands — and
+	// nothing else would ever ask the index again for url, since
+	// lookupEnrichment only ever looks up a URL once. Without this call,
+	// that race permanently stuck the UI on deriveTitleFromURL's fallback
+	// (e.g. "watch", from a YouTube URL's own path) instead of the real
+	// title, no matter how long enrichMetadata's own fetch took —
+	// reported as "why is there a delay resolving the YouTube title," but
+	// verified to actually be this race, not just a slow fetch.
+	p.invalidateEnrichment(url)
 }
 
 // resolve turns url into what mpd should actually be given, if a resolver
@@ -343,6 +355,36 @@ func (p *Player) Library(limit, offset int) ([]indexer.Result, error) {
 		return nil, errors.New("player: search indexer not configured")
 	}
 	return p.indexer.List(limit, offset)
+}
+
+// TrackInfo returns the best available title/artist/album for url without
+// playing or queuing anything — a synchronous, on-demand lookup for a
+// caller that already knows the exact URL and wants to describe it (e.g.
+// the browser extension's "now playing"/"queued" notification), as
+// opposed to Status/Queue's job of describing whatever mpd is currently
+// doing. Checks the search index first (the same source Status/Queue's
+// own enrichment ultimately reads from), falling back to
+// deriveTitleFromURL for the title alone if the index has nothing yet —
+// artist/album are simply empty in that case, same as everywhere else in
+// this package that models "not known yet" rather than guessing. Never
+// triggers a fetch/enrichment itself; it only reports whatever's already
+// there, so a URL indexed moments ago (still being enriched in the
+// background — see indexAsync) may briefly report a thinner answer than
+// it will a moment later.
+func (p *Player) TrackInfo(url string) (title, artist, album string, err error) {
+	url, err = normalizeURL(url)
+	if err != nil {
+		return "", "", "", err
+	}
+	if p.indexer != nil {
+		if result, ok, getErr := p.indexer.Get(url); getErr == nil && ok {
+			title, artist, album = result.Title, result.Artist, result.Album
+		}
+	}
+	if title == "" {
+		title = deriveTitleFromURL(url)
+	}
+	return title, artist, album, nil
 }
 
 // AddToLibrary upserts url into the search index with the given title,

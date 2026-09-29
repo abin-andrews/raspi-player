@@ -34,6 +34,7 @@ function NowPlayingScreen({ status, onClose, hideVolumeControl }) {
     canSeek,
     elapsed,
     isPlaying,
+    playPausePending,
     volume,
     primaryLine,
     setDragValue,
@@ -143,6 +144,7 @@ function NowPlayingScreen({ status, onClose, hideVolumeControl }) {
             variant="filled"
             radius="xl"
             size={64}
+            loading={playPausePending}
             onClick={handlePlayPause}
             aria-label={isPlaying ? 'Pause' : 'Play'}
           >

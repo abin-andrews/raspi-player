@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Pi Streamer Remote — Options</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        max-width: 480px;
+        margin: 40px auto;
+        color: #1a1b1e;
+      }
+      h1 {
+        font-size: 18px;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      input[type='text'] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px;
+        border: 1px solid #ced4da;
+        border-radius: 6px;
+        font-size: 14px;
+        margin-bottom: 12px;
+      }
+      p.hint {
+        font-size: 12px;
+        color: #868e96;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+      button {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 6px;
+        background: #1c7ed6;
+        color: white;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #495057;
+      }
+      #status {
+        margin-top: 12px;
+        font-size: 13px;
+      }
+      #status.ok {
+        color: #2f9e44;
+      }
+      #status.err {
+        color: #e03131;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Pi Streamer Remote</h1>
+    <label for="baseUrl">Daemon address</label>
+    <input type="text" id="baseUrl" placeholder="http://raspberrypi.local:8080" />
+    <p class="hint">
+      The base URL of your pi-streamer daemon (the same address the web UI is served from) — no trailing
+      path. Uses <code>POST /api/play</code>/<code>POST /api/queue</code> once saved.
+    </p>
+    <div class="row">
+      <button id="save">Save</button>
+      <button id="test" class="secondary">Test connection</button>
+    </div>
+    <p class="hint">
+      Don't know the address? Discovery tries common hostnames (works out of the box on a stock Raspberry
+      Pi OS install). If your Pi has a custom hostname or mDNS doesn't resolve on your network, enter the
+      address above manually instead.
+    </p>
+    <div class="row">
+      <button id="discover" class="secondary">Discover automatically</button>
+    </div>
+    <div id="status"></div>
+
+    <script src="discover.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

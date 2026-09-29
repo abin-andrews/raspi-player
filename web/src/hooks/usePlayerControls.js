@@ -13,6 +13,7 @@ export function usePlayerControls(status) {
   const [artFailed, setArtFailed] = useState(false)
   const [dragValue, setDragValue] = useState(null)
   const [dragVolume, setDragVolume] = useState(null)
+  const [playPausePending, setPlayPausePending] = useState(false)
   const lastNonZeroVolumeRef = useRef(100)
 
   useEffect(() => {
@@ -35,6 +36,7 @@ export function usePlayerControls(status) {
   const primaryLine = status?.title || status?.song || 'Nothing playing'
 
   async function handlePlayPause() {
+    setPlayPausePending(true)
     try {
       if (isPlaying) {
         await pause()
@@ -43,6 +45,8 @@ export function usePlayerControls(status) {
       }
     } catch (err) {
       console.error(err)
+    } finally {
+      setPlayPausePending(false)
     }
   }
 
@@ -110,6 +114,7 @@ export function usePlayerControls(status) {
     canSeek,
     elapsed,
     isPlaying,
+    playPausePending,
     volume,
     primaryLine,
     dragValue,

@@ -208,6 +208,9 @@ type fakePlayer struct {
 	removeFromLibrary []string
 	removeLibraryErr  error
 
+	trackInfoResult indexer.Result
+	trackInfoErr    error
+
 	queue              []mpdclient.QueueTrack
 	addToQueueCalls    []string
 	removeFromQueueIDs []int
@@ -352,6 +355,13 @@ func (f *fakePlayer) RemoveFromLibrary(url string) error {
 	return nil
 }
 
+func (f *fakePlayer) TrackInfo(url string) (title, artist, album string, err error) {
+	if f.trackInfoErr != nil {
+		return "", "", "", f.trackInfoErr
+	}
+	return f.trackInfoResult.Title, f.trackInfoResult.Artist, f.trackInfoResult.Album, nil
+}
+
 func (f *fakePlayer) Queue() ([]mpdclient.QueueTrack, error) {
 	if f.forceErr != nil {
 		return nil, f.forceErr
@@ -414,6 +424,23 @@ func doRequest(t *testing.T, h http.Handler, method, path, body string) *httptes
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+func TestHandleDiscover(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/discover", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got discoveryResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Service != "pi-streamer" {
+		t.Errorf("service = %q, want %q", got.Service, "pi-streamer")
+	}
 }
 
 func TestHandlePlay(t *testing.T) {
@@ -986,6 +1013,46 @@ func TestHandleSearch(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != p.searchResults[0] {
 		t.Errorf("results = %v, want %v", got, p.searchResults)
+	}
+}
+
+func TestHandleTrackInfo(t *testing.T) {
+	p := newFakePlayer()
+	p.trackInfoResult = indexer.Result{Title: "Real Title", Artist: "Real Artist", Album: "Real Album"}
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/track?url=http://example.com/x.mp3", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got trackInfoResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	want := trackInfoResponse{Title: "Real Title", Artist: "Real Artist", Album: "Real Album"}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestHandleTrackInfoMissingURL(t *testing.T) {
+	p := newFakePlayer()
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/track", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleTrackInfoError(t *testing.T) {
+	p := newFakePlayer()
+	p.trackInfoErr = errors.New("boom")
+	h := newRouter(p)
+
+	rec := doRequest(t, h, "GET", "/api/track?url=http://example.com/x.mp3", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 

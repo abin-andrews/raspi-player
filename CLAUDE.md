@@ -224,6 +224,17 @@ web/                    React (Vite) + Mantine player UI, 2 header tabs plus a s
 deploy/                 Deployment assets that don't belong under cmd/ or scripts/: currently just
                         pi-streamer.service.tmpl, the systemd unit template scripts/deploy-pi.sh renders and
                         installs on the Pi. See Commands below.
+extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): a content script
+                        (content.js/content.css) overlays a Play/Queue button pair directly on every
+                        YouTube video thumbnail; right-clicking any other link offers the same Play/Queue
+                        pair via the context menu; a popup covers pasting a URL manually. All three funnel
+                        through background.js's one sendToStreamer, talking to the daemon's existing HTTP
+                        API. Self-discovers the daemon's address on the LAN via mDNS hostname probing
+                        rather than requiring it be typed in (a full subnet scan was attempted and
+                        deliberately dropped — extensions can't use chrome.system.network) — the one actual
+                        daemon-side addition this needed is a small identifying endpoint, GET /api/discover,
+                        plus GET /api/track for naming the track in success notifications. See Architecture
+                        notes and extension/README.md for install/usage.
 ```
 
 ## Architecture notes for future work
@@ -302,6 +313,8 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   `POST /api/volume {volume}` (clamped 0-100 in `internal/player`), `GET /api/search?q=&limit=`,
   `GET /api/library?limit=&offset=` (every indexed entry, no query — the Library tab; `Player.Library`
   errors the same way `Search` does if no indexer is configured),
+  `GET /api/track?url=` (`Player.TrackInfo` — best-available title/artist/album for a URL on demand,
+  without playing/queuing it; used by `extension/`'s notifications, see below),
   `POST /api/library {url,title,artist,album,tags}` (upsert by url — add a new entry or edit an existing
   one by resubmitting the same url with changed fields; `Player.AddToLibrary` tries a synchronous
   `MetadataFetcher` fetch first if title/artist/album are all empty) and `DELETE /api/library?url=`
@@ -494,22 +507,35 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   false)` rather than guessing for a URL `IsYouTubeURL` still accepts but that doesn't identify a single
   video at all (a bare channel or playlist-only URL) — there's no video to build a thumbnail URL or fetch a
   title for in that case.
-  **Album art: the video thumbnail, not mpd or MusicBrainz** (`ThumbnailFetcher`, wired into
-  `artAdapter.resolveYouTubeThumbnail` in `cmd/pi-streamer/albumart.go`) — `artAdapter.resolve`'s general
-  path (try `mpd.AlbumArt`, fall back to MusicBrainz) is actively the *wrong* thing to try for a YouTube URL:
-  mpd never has the *original* `youtube.com` URL under any queue entry at all (it only ever sees the
-  resolved local-proxy URL the extracted audio was served from — see `modeResolver` above), so
-  `AlbumArt(youtubeURL)` would always come back empty, and the MusicBrainz fallback needs artist/album,
-  which a YouTube track typically doesn't have until/unless a user edits it in. `resolve` therefore checks
-  `a.thumbnails != nil && ytdlp.IsYouTubeURL(url)` *before* even attempting the general path, going straight
-  to `ThumbnailFetcher.Fetch` instead. `Fetch` tries `maxresdefault.jpg` (highest resolution) first, falling
-  back to `hqdefault.jpg` (480×360, guaranteed to exist for every real video, unlike maxres) on *any* failure
-  fetching the first one — a 404 or a genuine network error are treated identically, since the only thing
-  that matters is "did we get bytes back." Both sizes 404ing is treated the same as mpd's own confirmed-no-
-  art answer (`(nil, nil)`, cached as such via `artstore.Store.Put` exactly like every other source) rather
-  than an error. `a.thumbnails` is nil-able the same way `a.coverArt` is — with no thumbnail fetcher
-  configured, a YouTube URL simply falls through to the general path (which will just find nothing, same net
-  effect, via one pointless `mpd.AlbumArt` round trip instead of a thumbnail fetch).
+  **Album art: the video thumbnail, computed directly, never fetched or cached by this daemon**
+  (`ytdlp.HQThumbnailURL`, checked first thing in both `artAdapter.resolve` and `artAdapter.Query` in
+  `cmd/pi-streamer/albumart.go`) — `artAdapter.resolve`'s general path (try `mpd.AlbumArt`, fall back to
+  MusicBrainz) is actively the *wrong* thing to try for a YouTube URL: mpd never has the *original*
+  `youtube.com` URL under any queue entry at all (it only ever sees the resolved local-proxy URL the
+  extracted audio was served from — see `modeResolver` above), so `AlbumArt(youtubeURL)` would always come
+  back empty, and the MusicBrainz fallback needs artist/album, which a YouTube track typically doesn't have
+  until/unless a user edits it in. An earlier version fetched the thumbnail's bytes itself (`ThumbnailFetcher`,
+  trying `maxresdefault.jpg` then falling back to `hqdefault.jpg`) and persisted them to `internal/artstore`
+  exactly like mpd/MusicBrainz art — replaced by simply returning YouTube's own public CDN URL
+  (`https://i.ytimg.com/vi/<id>/hqdefault.jpg`, guaranteed to exist for every real video) directly: there was
+  never anything to fetch-and-cache in the first place, since the thumbnail is already a stable, permanent,
+  publicly reachable URL computed purely from the video ID, with zero network I/O of this daemon's own.
+  `resolve` returns it before even checking the disk cache or `force`/Refresh (the answer never changes, so
+  those concepts don't apply), and `Query` — normally cache-only, never fetching — returns it too for any
+  *unknown* URL, specifically so a freshly queued/played video's thumbnail shows up immediately without
+  waiting on a first `GET /api/albumart` round trip to populate anything. A track's own custom art (checked
+  first in both) still wins over this, same as ever. `ThumbnailFetcher` itself, now fully unused, was deleted
+  outright, along with its tests — see `internal/ytdlp/ytdlp.go`'s history if the byte-fetching approach is
+  ever needed again (e.g. to also mirror the image for an offline/no-egress deployment).
+  **Two different thumbnail sizes for two different contexts** — `resolve` actually uses
+  `ytdlp.HQThumbnailURL` (480×360) while `Query` uses `ytdlp.DefaultThumbnailURL` (120×90, YouTube's
+  smallest generated size, same "exists for every video" guarantee as hqdefault): `Query` backs *list*
+  views (Library/Queue/search results, batched via `useAlbumArtStatus`) showing many thumbnails at once,
+  where the smaller size means less bandwidth/faster loading for something displayed small anyway;
+  `resolve` (via `GET /api/albumart`, i.e. `albumArtUrl()`) backs the few places a *single* track's art is
+  shown large — the "now playing" view (`PlayerBar`'s mini art, `NowPlayingScreen`'s big art) and the
+  Library track detail page, both of which call `albumArtUrl`/hit `TrackArt`'s no-batched-query fallback
+  path directly rather than going through `Query` at all.
   **Title: YouTube's oEmbed endpoint, independent of extraction/embedding** (`TitleFetcher`, wired into
   `metadataAdapter.Fetch` in `cmd/pi-streamer/metadata.go`) — `--embed-metadata` (above) already gets a real
   title onto the *extracted audio file* for mpd's own tag-reading to pick up once the track is actually
@@ -595,6 +621,19 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   instance: played an `ffmpeg`-tagged file, confirmed `GET /api/status` showed its embedded tags, edited
   its Artist/Album via `POST /api/library` while it was still playing, and confirmed `GET /api/status`
   reflected the edit immediately, with no track change needed.
+  **A second, unrelated race in the same cache caused a real "title never resolves" bug**: `enrichMetadata`
+  (the background goroutine that fetches a brand-new URL's real title/artist/album — see the URL-dedup/
+  metadata-enrichment note below) never called `invalidateEnrichment` after successfully re-indexing with
+  the real data. `lookupEnrichment`'s *very first* call for a URL (typically `Status`/`Queue`'s first poll
+  right after `PlayURL`/`AddToQueue` returns) races `indexAsync`'s own two-step flow: if that first
+  `lookupEnrichment` call's background `refreshEnrichment` reads the index *before* `enrichMetadata`'s real
+  update lands, it caches `indexAsync`'s thin, title-less `IndexURL` call as `resolved: true` — and since a
+  URL is only ever looked up once, nothing would ask the index again for it, permanently stuck on
+  `deriveTitleFromURL`'s fallback (e.g. a bare "watch" for a YouTube URL, whose path is just `/watch`)
+  regardless of how long `enrichMetadata`'s own fetch took. This is what a report of "why is there a delay
+  resolving the YouTube title" traced back to — not a slow fetch, a lost race with no recovery. Fixed by
+  having `enrichMetadata` call `p.invalidateEnrichment(url)` after its own successful `IndexURL`, the exact
+  same recovery `AddToLibrary` already had for a manual edit.
 - **Media library** (`internal/search.Index.List`, `GET /api/library`, the Library tab): "remembers every URL
   added, referred at any point in future" turned out to need **no new persistence** — `internal/search`'s
   SQLite index already durably indexes every played/favorited/playlisted URL (`player.index`'s best-effort
@@ -761,6 +800,22 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   directly) specifically so `NowPlayingScreen` wouldn't need its own separate copy of the same logic just to
   render it bigger. Nothing about the daemon's WebSocket-pushed `status` changed for this — both components
   still just receive it as a prop from `App.jsx`, same as before.
+  **`usePlayerControls`'s `playPausePending`** — `PlayerBar`/`NowPlayingScreen`'s play/pause `ActionIcon`
+  passes it straight to Mantine's own `loading` prop (which `ActionIcon` supports natively — no custom
+  spinner markup needed), set for the duration of `handlePlayPause`'s `pause`/`resume` call, so the button
+  itself shows it's working rather than sitting inert while a request is in flight.
+- **Play buttons show a spinner while a fresh `PlayURL` is in flight** (`Library.jsx`'s `pendingPlayUrl`,
+  passed to `LibraryEntryRow`/`LibraryEntryGridCard`/the track detail page's Play `Button` as `isPending`/
+  `loading`) — a *newly submitted* YouTube URL's `POST /api/play` can take a real, visible while to respond
+  (the daemon extracts its audio via yt-dlp before mpd ever starts playing — see the YouTube-URL
+  architecture note above), unlike `PlayerBar`'s play/pause toggle (`playPausePending`, above), which only
+  ever pauses/resumes whatever's *already* loaded and is never this slow. `pendingPlayUrl` tracks the one
+  URL currently submitting (not a generic boolean), so only the specific row/card/button that was actually
+  clicked shows the spinner — every other row's Play icon stays as-is. Each component uses Mantine's own
+  `loading` prop directly (`ActionIcon`/`Button` both support it natively) rather than hand-rolling a
+  `Loader` swap; the grid card's Play action lives behind its overflow `Menu` (which closes on click, so a
+  spinner there wouldn't be visible), so its *menu-trigger* `ActionIcon` (the "..." dots) shows loading
+  instead — visible on the card itself, and doubling as a guard against reopening the menu mid-request.
 - **URL dedup and add-time metadata enrichment** (`internal/urlnorm`, `internal/metadata`,
   `internal/player.Player.index`): every URL-accepting entry point (`PlayURL`, `AddToQueue`, `AddFavorite`,
   `RemoveFavorite`, `AddToPlaylist`) normalizes the URL first (`urlnorm.Normalize`: lowercases scheme/host,
@@ -990,6 +1045,87 @@ deploy/                 Deployment assets that don't belong under cmd/ or script
   server) has no such safety net; an unrecovered panic there takes the entire process down. `cmd/pi-streamer`'s
   `safeGo(name, fn)` wraps every one of these with a `recover` that logs (`panic in %s: %v\n%s` plus a stack
   trace) instead of exiting — used everywhere a bare `go` used to appear in `main.go`/`bucket.go`.
+- **Chrome extension talks straight to the daemon's HTTP API** (`extension/`, Manifest V3): a link's
+  context menu ("Play now in Pi Streamer" / "Queue in Pi Streamer" — the *only* UI surface, deliberately;
+  an earlier draft also had "play the current tab"/keyboard-shortcut variants, removed by explicit
+  request since links are the actual use case) plus a popup for pasting a URL manually, both reusing
+  `POST /api/play`/`POST /api/queue` (the exact same `{url}` JSON body `web/src/api.js` already sends) —
+  no new endpoint needed for the play/queue calls themselves. The daemon has no CORS headers configured
+  anywhere (`internal/api/router.go` — confirmed, not assumed), which would normally block a cross-origin
+  `fetch` from any other origin — but Chrome exempts `fetch`/`XHR` made from an extension's *own* pages
+  (its background service worker, popup, or options page) from CORS enforcement for any origin covered by
+  the manifest's `host_permissions`, so this works against the plain HTTP API unmodified. That exemption
+  only applies to requests the extension itself makes from those contexts — it is not a way for an
+  arbitrary web page's own script to bypass CORS, and doesn't weaken the daemon's no-CORS-configured
+  stance for anything else. `background.js`'s `sendToStreamer` is the one place that calls the daemon at
+  all (the context menu and `popup.js`, the latter via a `chrome.runtime.sendMessage` round trip) — kept
+  singular so the discovery-fallback/notification logic below exists exactly once.
+  **Self-discovery, not a typed-in address** (`extension/discover.js`) — a Chrome extension has no mDNS/
+  DNS-SD *browsing* API (no way to enumerate `_http._tcp` services), so `discoverStreamer()` tries a short
+  list of common `.local` hostnames (`raspberrypi.local`/`pi-streamer.local`/`pi.local`): resolving a
+  *specific, already-known* `.local` name is something the OS's own mDNS resolver does for free on any
+  `fetch()`, which is why this works unmodified against a stock Raspberry Pi OS install (default hostname
+  `raspberrypi.local`, Avahi already running) with zero setup on the Pi side and zero extra permissions
+  here. `probeCandidate` requires a positive identification via `GET /api/discover` returning
+  `{"service": "pi-streamer"}` — never accepting "something answered on this port," since an unrelated LAN
+  device could be running any HTTP server on 8080.
+  **A full subnet sweep was attempted, then deliberately dropped**: `chrome.system.network.
+  getNetworkInterfaces()` would be the natural way to learn the extension's own subnet for a broader scan,
+  but that API is restricted to packaged apps and isn't usable from a regular extension at all — confirmed
+  against a real Chrome error ("'system.network' is only allowed for packaged apps"), not assumed from
+  docs. The one workaround (forcing WebRTC's ICE candidates to leak real local IPs, via
+  `chrome.privacy.network.webRTCIPHandlingPolicy` and the `"privacy"` permission) was raised and explicitly
+  declined: it disables a real anti-fingerprinting protection *browser-wide*, for every tab, for as long as
+  the extension stays installed — not a cost worth paying for a fallback that still isn't guaranteed to
+  work on every OS/network. Anything mDNS doesn't resolve (a custom Pi hostname, a network without mDNS)
+  falls back to typing the address into `options.html` manually — plain, no privacy tradeoff, and already
+  needed as a fallback regardless. **The one real daemon-side addition**:
+  `handleDiscover`/`discoveryResponse` (`internal/api/handlers.go`, registered as `GET /api/discover` in
+  `router.go`) — deliberately static and dependency-free, touching neither `Player` nor mpd, so it answers
+  instantly even if mpd itself isn't connected (every *other* endpoint either needs a live mpd connection
+  or at least the `Player` wiring; discovery needs to work regardless, since "is this even pi-streamer" has
+  to be answerable before anything else is known about the daemon's state). `sendToStreamer` treats
+  discovery as automatic, self-healing fallback, not just a manual options-page action: no saved address at
+  all, or a fetch to the saved one failing with a network-level error specifically (a `TypeError` — the
+  daemon's unreachable at that address — as opposed to an application error, where the daemon responded
+  and just rejected the URL, which rediscovery can't fix) triggers `discoverStreamer()`, and a hit is saved
+  back to `chrome.storage.sync` and the original request retried — covering the daemon's address changing
+  (DHCP lease renewal) without the user ever noticing. `options.html`'s "Discover automatically" button
+  runs the identical function for a manual on-demand trigger, and "Test connection" also hits
+  `GET /api/discover` now rather than `GET /api/queue`, for the same "positively identify pi-streamer, not
+  just anything that answered" reasoning, and because it doesn't require mpd to be connected either.
+  **Feedback via `chrome.notifications`**, not a toolbar badge: a context-menu click has no popup open to
+  show a status message in, so `notify()` posts a native OS notification (`"notifications"` permission)
+  confirming success/failure for every `sendToStreamer` call — including "nothing found on this network,"
+  which also opens the options page so the user isn't left guessing why nothing happened.
+  **The success notification names the actual track** (`fetchTrackInfo`/`describeTrack`/`notifySuccess`),
+  not a generic "Now playing."/"Added to queue." — backed by the one other daemon-side addition this
+  extension needed, `GET /api/track?url=` → `Player.TrackInfo` (`internal/player/player.go`): a synchronous,
+  on-demand title/artist/album lookup for a URL the caller already knows, distinct from `Status`/`Queue`'s
+  job of describing whatever mpd is currently doing — checks the search index (`Indexer.Get`), falling back
+  to `deriveTitleFromURL` for the title alone if unindexed, and never triggers a fetch/enrichment itself.
+  Because a URL *just* submitted may still be enriching in the background (`indexAsync`/`enrichMetadata` —
+  see above), `fetchTrackInfo` gives it one short second chance (a 1.2s wait, then one retry) if the first
+  answer has no artist and no album at all, rather than settling immediately for a thin, still-enriching
+  result.
+  **YouTube thumbnail overlay** (`extension/content.js`+`content.css`, a Manifest V3 content script matched
+  to `https://www.youtube.com/*`) — right-clicking every individual video was still one context-menu round
+  trip too many for the actual common case (browsing YouTube, wanting to send several videos to the
+  daemon); this overlays a ▶/+ button pair directly on each thumbnail instead. YouTube is a single-page
+  app — thumbnails load continuously while scrolling infinite feeds, and navigating between pages never
+  reloads the document at all — so a one-time DOM pass on load isn't enough; a `MutationObserver` on
+  `document.documentElement` watches for newly added thumbnails for as long as the tab stays open.
+  `a#thumbnail`/`a.ytd-thumbnail` covers grid tiles, search results, sidebar recommendations, playlist
+  rows, and Shorts uniformly; each anchor's `href` is canonicalized to a plain `watch?v=<id>`/`shorts/<id>`
+  URL and marked processed (`data-pi-streamer-done`) so the observer never double-attaches an overlay to
+  the same thumbnail as YouTube's own JS mutates the DOM around it. The overlay's buttons send the exact
+  same `{type: 'send-to-streamer', url, mode}` message `background.js` already handles for the context
+  menu and popup — `background.js` needed zero changes for this, it was already generic over *how* a
+  request arrives. Click handling is capture-phase with `stopImmediatePropagation`, not just
+  `preventDefault`/`stopPropagation`: YouTube attaches its own "navigate to this video" handling very close
+  to the anchor itself, and a plain bubbling listener wasn't reliably early enough to stop it. This is the
+  one piece of the extension that reaches into a third-party page's DOM at all — everything else
+  (background/popup/options) only ever talks to the daemon's own API.
 - **OLED line-length backstop** (`cmd/pi-streamer/oled.go`): `arduino/control.ino` discards an oversized
   command *entirely* rather than gracefully shortening it (replying `ERR`, leaving that field unchanged) — a
   fallback title built from a full URL (see the title-fallback note above) routinely exceeds `TITLE_CAP`/

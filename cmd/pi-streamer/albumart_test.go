@@ -46,21 +46,6 @@ func (f *fakeCoverArtFetcher) Fetch(ctx context.Context, artist, album string) (
 	return f.data[key], nil
 }
 
-// fakeThumbnailFetcher is an in-memory thumbnailFetcher for tests.
-type fakeThumbnailFetcher struct {
-	data  map[string][]byte // youtube url -> thumbnail bytes
-	err   error
-	calls []string
-}
-
-func (f *fakeThumbnailFetcher) Fetch(ctx context.Context, youtubeURL string) ([]byte, error) {
-	f.calls = append(f.calls, youtubeURL)
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.data[youtubeURL], nil
-}
-
 func (f *fakeCoverArtFetcher) SearchMetadata(ctx context.Context, query string, limit int) ([]coverart.MetadataSuggestion, error) {
 	f.suggestCalls = append(f.suggestCalls, query)
 	if f.suggestErr != nil {
@@ -183,72 +168,55 @@ func TestResolveDoesNotCacheTransientError(t *testing.T) {
 	}
 }
 
-func TestResolveUsesYouTubeThumbnailInsteadOfMPDForYouTubeURLs(t *testing.T) {
+func TestResolveReturnsDirectYouTubeThumbnailURLInsteadOfMPD(t *testing.T) {
 	a, mpd, _ := newTestArtAdapter(t)
-	thumbs := &fakeThumbnailFetcher{data: map[string][]byte{
-		"https://youtu.be/abc123XYZ90": []byte("\xff\xd8\xff\xe0thumbnailbytes"),
-	}}
-	a.thumbnails = thumbs
 
 	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
-	if !ok || path == "" {
-		t.Fatalf("Resolve() = %q, %v, want a non-empty path and ok=true from the thumbnail", path, ok)
+	want := "https://i.ytimg.com/vi/abc123XYZ90/hqdefault.jpg"
+	if !ok || path != want {
+		t.Fatalf("Resolve() = %q, %v, want (%q, true)", path, ok, want)
 	}
 	if len(mpd.calls) != 0 {
 		t.Errorf("mpd.calls = %v, want none — a YouTube URL should never reach mpd.AlbumArt", mpd.calls)
 	}
-	if len(thumbs.calls) != 1 || thumbs.calls[0] != "https://youtu.be/abc123XYZ90" {
-		t.Errorf("thumbs.calls = %v, want one entry for the submitted YouTube URL", thumbs.calls)
+}
+
+func TestResolveYouTubeThumbnailNeedsNoNetworkOrCache(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t)
+
+	// Calling twice (the second via Refresh, force=true) must behave
+	// identically either way, and never touch mpd or persist anything —
+	// the answer is a pure function of the URL's video ID.
+	first, ok1, err1 := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
+	second, ok2, err2 := a.Refresh("https://youtu.be/abc123XYZ90", "", "")
+	if err1 != nil || err2 != nil || !ok1 || !ok2 || first != second {
+		t.Fatalf("Resolve/Refresh = (%q,%v,%v)/(%q,%v,%v), want identical ok results",
+			first, ok1, err1, second, ok2, err2)
+	}
+	if len(mpd.calls) != 0 {
+		t.Errorf("mpd.calls = %v, want none", mpd.calls)
+	}
+	if _, _, known := a.store.Lookup("https://youtu.be/abc123XYZ90"); known {
+		t.Error("store.Lookup: want unknown — a YouTube thumbnail is never persisted to the artstore")
 	}
 }
 
-func TestResolveFallsThroughToMPDForYouTubeURLsWithoutAThumbnailFetcher(t *testing.T) {
-	a, mpd, _ := newTestArtAdapter(t) // a.thumbnails left nil, as newTestArtAdapter leaves it
-	mpd.data["https://youtu.be/abc123XYZ90"] = []byte("\xff\xd8\xff\xe0mpdbytes")
+func TestResolveYouTubeCustomArtStillWins(t *testing.T) {
+	a, _, _ := newTestArtAdapter(t)
+	srv := fakeImageServer(t, []byte("\xff\xd8\xff\xe0custom"))
+	if _, err := a.SetCustomArt("track", "https://youtu.be/abc123XYZ90", srv.URL); err != nil {
+		t.Fatalf("SetCustomArt: %v", err)
+	}
 
 	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
 	if err != nil {
 		t.Fatalf("Resolve() error = %v, want nil", err)
 	}
-	if !ok || path == "" {
-		t.Fatalf("Resolve() = %q, %v, want the ordinary mpd path used with no thumbnail fetcher configured", path, ok)
-	}
-	if len(mpd.calls) != 1 {
-		t.Errorf("mpd.calls = %v, want exactly one — the ordinary path should still run", mpd.calls)
-	}
-}
-
-func TestResolvePropagatesThumbnailFetcherError(t *testing.T) {
-	a, _, _ := newTestArtAdapter(t)
-	a.thumbnails = &fakeThumbnailFetcher{err: errors.New("network unreachable")}
-
-	if _, _, err := a.Resolve("https://youtu.be/abc123XYZ90", "", ""); err == nil {
-		t.Error("Resolve(): want error when the thumbnail fetcher fails, got nil")
-	}
-}
-
-func TestResolveCachesConfirmedNoThumbnail(t *testing.T) {
-	a, _, _ := newTestArtAdapter(t)
-	thumbs := &fakeThumbnailFetcher{data: map[string][]byte{}} // no entry -> nil bytes, confirmed no art
-	a.thumbnails = thumbs
-
-	path, ok, err := a.Resolve("https://youtu.be/abc123XYZ90", "", "")
-	if err != nil {
-		t.Fatalf("Resolve() error = %v, want nil", err)
-	}
-	if ok || path != "" {
-		t.Errorf("Resolve() = %q, %v, want ok=false for a confirmed-missing thumbnail", path, ok)
-	}
-
-	// A second Resolve for the same URL must hit the cache, not fetch again.
-	if _, _, err := a.Resolve("https://youtu.be/abc123XYZ90", "", ""); err != nil {
-		t.Fatalf("Resolve() (second call) error = %v, want nil", err)
-	}
-	if len(thumbs.calls) != 1 {
-		t.Errorf("thumbs.calls = %v, want exactly 1 (cached after the first confirmed-no-art result)", thumbs.calls)
+	if !ok || path == "https://i.ytimg.com/vi/abc123XYZ90/hqdefault.jpg" {
+		t.Errorf("Resolve() = %q, %v, want the custom art path, not the YouTube thumbnail", path, ok)
 	}
 }
 
@@ -329,6 +297,24 @@ func TestQueryReportsKnownURLsOnlyWithoutFetching(t *testing.T) {
 	}
 	if _, known := got["http://example.com/never-seen.mp3"]; known {
 		t.Error("never-seen.mp3 should be omitted from the result entirely")
+	}
+	if len(mpd.calls) != 0 {
+		t.Errorf("mpd.calls = %v, want none — Query must never fetch", mpd.calls)
+	}
+}
+
+func TestQueryReportsYouTubeThumbnailForAnUnresolvedURL(t *testing.T) {
+	a, mpd, _ := newTestArtAdapter(t)
+
+	got := a.Query([]string{"https://youtu.be/abc123XYZ90"})
+
+	// Deliberately the small default.jpg, not hqdefault.jpg — Query backs
+	// list views showing many thumbnails at once (see resolve's own test,
+	// TestResolveReturnsDirectYouTubeThumbnailURLInsteadOfMPD, for the
+	// bigger size used for a single prominently-displayed track).
+	want := "https://i.ytimg.com/vi/abc123XYZ90/default.jpg"
+	if status := got["https://youtu.be/abc123XYZ90"]; !status.HasArt || status.Path != want {
+		t.Errorf("got %+v, want HasArt=true, Path=%q", status, want)
 	}
 	if len(mpd.calls) != 0 {
 		t.Errorf("mpd.calls = %v, want none — Query must never fetch", mpd.calls)

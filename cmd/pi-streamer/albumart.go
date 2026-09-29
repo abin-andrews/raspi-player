@@ -46,17 +46,10 @@ type libraryLister interface {
 	Library(limit, offset int) ([]indexer.Result, error)
 }
 
-// thumbnailFetcher is the narrow slice of *ytdlp.ThumbnailFetcher's
-// behavior artAdapter needs.
-type thumbnailFetcher interface {
-	Fetch(ctx context.Context, youtubeURL string) ([]byte, error)
-}
-
 // artAdapter implements internal/api.Art.
 type artAdapter struct {
 	mpd        albumArtFetcher
-	coverArt   coverArtFetcher  // may be nil — MusicBrainz fallback is then skipped entirely
-	thumbnails thumbnailFetcher // may be nil — YouTube thumbnails are then skipped entirely
+	coverArt   coverArtFetcher // may be nil — MusicBrainz fallback is then skipped entirely
 	library    libraryLister
 	store      *artstore.Store
 	jobs       *jobs.Manager
@@ -93,6 +86,23 @@ func (a *artAdapter) resolve(url, artist, album string, force bool) (path string
 		if name, hasArt, _ := a.store.Lookup(url); hasArt {
 			return "/art/" + name, true, nil
 		}
+	}
+
+	// A YouTube video's thumbnail is a stable, already-public CDN URL
+	// computed directly from its video ID — there's nothing to fetch or
+	// cache locally at all, unlike mpd/MusicBrainz art, which only exists
+	// anywhere once this package downloads it. Returning it straight away
+	// (before the cache/force check below, and skipping fetchAuto entirely)
+	// means this never depends on a prior resolve, a disk cache entry, or
+	// force/Refresh — the answer is always the same, computed instantly
+	// with zero network I/O of our own. Uses the bigger hqdefault.jpg,
+	// unlike Query's otherwise-identical shortcut below: resolve backs the
+	// few places a single track's art is shown large (the "now playing"
+	// view via albumArtUrl, a track's own detail page), where Query backs
+	// list views showing many thumbnails at once — see
+	// ytdlp.HQThumbnailURL/DefaultThumbnailURL's doc comments.
+	if thumb, ok := ytdlp.HQThumbnailURL(url); ok {
+		return thumb, true, nil
 	}
 
 	if !force {
@@ -134,19 +144,16 @@ func (a *artAdapter) resolve(url, artist, album string, force bool) (path string
 	return "/art/" + name, true, nil
 }
 
-// fetchAuto runs the existing (non-custom) auto-resolution chain —
-// YouTube thumbnail if applicable, otherwise mpd falling back to
-// MusicBrainz — and returns raw image bytes, or nil if none of them
-// found anything. A fallback-lookup failure (MusicBrainz unreachable) is
-// swallowed (logged, not returned) rather than failing the whole
-// resolve: mpd already gave a confirmed answer, and an external service
-// being unreachable shouldn't turn that into an error response or
-// (worse) prevent caching mpd's own confirmed-no-art result.
+// fetchAuto runs the existing (non-custom) auto-resolution chain — mpd,
+// falling back to MusicBrainz — and returns raw image bytes, or nil if
+// neither found anything. YouTube URLs never reach here at all: resolve
+// returns the video's own thumbnail before calling this, unconditionally.
+// A fallback-lookup failure (MusicBrainz unreachable) is swallowed
+// (logged, not returned) rather than failing the whole resolve: mpd
+// already gave a confirmed answer, and an external service being
+// unreachable shouldn't turn that into an error response or (worse)
+// prevent caching mpd's own confirmed-no-art result.
 func (a *artAdapter) fetchAuto(url, artist, album string) ([]byte, error) {
-	if a.thumbnails != nil && ytdlp.IsYouTubeURL(url) {
-		return a.thumbnails.Fetch(context.Background(), url)
-	}
-
 	data, err := a.mpd.AlbumArt(url)
 	if err != nil {
 		return nil, err
@@ -315,14 +322,27 @@ func (a *artAdapter) Query(urls []string) map[string]api.ArtStatus {
 	out := make(map[string]api.ArtStatus, len(urls))
 	for _, u := range urls {
 		name, hasArt, known := a.store.Lookup(u)
-		if !known {
+		if known {
+			status := api.ArtStatus{HasArt: hasArt}
+			if hasArt {
+				status.Path = "/art/" + name
+			}
+			out[u] = status
 			continue
 		}
-		status := api.ArtStatus{HasArt: hasArt}
-		if hasArt {
-			status.Path = "/art/" + name
+		// Not yet resolved at all — but a YouTube video's thumbnail needs
+		// no resolving in the first place (see resolve's identical
+		// shortcut): report it here too, so a freshly queued/played video
+		// shows its real thumbnail immediately rather than a placeholder
+		// until some later GET /api/albumart request happens to populate
+		// the cache. Query backs list views (Library/Queue/search results,
+		// batched via useAlbumArtStatus) showing many thumbnails at once,
+		// so this deliberately uses the smaller default.jpg — resolve's
+		// identical shortcut below uses the bigger hqdefault.jpg for the
+		// few places a single track's art is shown large.
+		if thumb, ok := ytdlp.DefaultThumbnailURL(u); ok {
+			out[u] = api.ArtStatus{HasArt: true, Path: thumb}
 		}
-		out[u] = status
 	}
 	return out
 }

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Pi Streamer Remote</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        width: 300px;
+        margin: 0;
+        padding: 12px;
+        color: #1a1b1e;
+      }
+      h1 {
+        font-size: 14px;
+        font-weight: 700;
+        margin: 0 0 10px;
+      }
+      p.hint {
+        font-size: 11px;
+        color: #868e96;
+        margin: 0 0 10px;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      button {
+        flex: 1;
+        padding: 8px 10px;
+        border: none;
+        border-radius: 6px;
+        background: #1c7ed6;
+        color: white;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #495057;
+      }
+      button:hover {
+        opacity: 0.9;
+      }
+      input[type='text'] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        border: 1px solid #ced4da;
+        border-radius: 6px;
+        font-size: 13px;
+        margin-bottom: 8px;
+      }
+      #status {
+        font-size: 12px;
+        min-height: 16px;
+        margin-top: 8px;
+      }
+      #status.ok {
+        color: #2f9e44;
+      }
+      #status.err {
+        color: #e03131;
+      }
+      .options-link {
+        display: block;
+        text-align: center;
+        font-size: 11px;
+        color: #868e96;
+        margin-top: 10px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Pi Streamer Remote</h1>
+    <p class="hint">Tip: right-click any link on a page for a one-click Play/Queue menu.</p>
+
+    <input type="text" id="manualUrl" placeholder="Paste a URL…" />
+    <div class="row">
+      <button id="playManual">Play</button>
+      <button id="queueManual" class="secondary">Queue</button>
+    </div>
+
+    <div id="status"></div>
+    <div class="options-link" id="openOptions">Configure daemon address</div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

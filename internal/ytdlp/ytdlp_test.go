@@ -118,6 +118,23 @@ func TestHQThumbnailURLUsesTheExtractedVideoID(t *testing.T) {
 	}
 }
 
+func TestDefaultThumbnailURLUsesTheExtractedVideoID(t *testing.T) {
+	got, ok := DefaultThumbnailURL("https://www.youtube.com/watch?v=abc123XYZ90")
+	if !ok {
+		t.Fatal("DefaultThumbnailURL: want ok=true")
+	}
+	want := "https://i.ytimg.com/vi/abc123XYZ90/default.jpg"
+	if got != want {
+		t.Errorf("DefaultThumbnailURL() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultThumbnailURLReturnsFalseWithoutAnExtractableVideoID(t *testing.T) {
+	if _, ok := DefaultThumbnailURL("https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"); ok {
+		t.Error("DefaultThumbnailURL: want ok=false for a URL with no video ID")
+	}
+}
+
 func TestThumbnailURLFailsWithoutAnExtractableVideoID(t *testing.T) {
 	if _, ok := ThumbnailURL("https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"); ok {
 		t.Error("ThumbnailURL: want ok=false for a URL with no video ID")
@@ -298,83 +315,5 @@ func TestFetchTitleFailsOnMalformedJSON(t *testing.T) {
 	f := &TitleFetcher{baseURL: srv.URL}
 	if _, ok := f.FetchTitle(context.Background(), "https://youtu.be/abc123XYZ90"); ok {
 		t.Error("FetchTitle: want ok=false on a malformed response body")
-	}
-}
-
-func TestThumbnailFetcherPrefersMaxresWhenAvailable(t *testing.T) {
-	var gotPaths []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPaths = append(gotPaths, r.URL.Path)
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write([]byte("\xff\xd8\xff\xe0maxresbytes"))
-	}))
-	defer srv.Close()
-
-	f := &ThumbnailFetcher{baseURL: srv.URL}
-	data, err := f.Fetch(context.Background(), "https://youtu.be/abc123XYZ90")
-	if err != nil {
-		t.Fatalf("Fetch() error = %v, want nil", err)
-	}
-	if string(data) != "\xff\xd8\xff\xe0maxresbytes" {
-		t.Errorf("Fetch() = %q, want the maxres bytes", data)
-	}
-	if len(gotPaths) != 1 || gotPaths[0] != "/vi/abc123XYZ90/maxresdefault.jpg" {
-		t.Errorf("requested paths = %v, want exactly one request for maxresdefault.jpg", gotPaths)
-	}
-}
-
-func TestThumbnailFetcherFallsBackToHQWhenMaxresIs404(t *testing.T) {
-	var gotPaths []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPaths = append(gotPaths, r.URL.Path)
-		if r.URL.Path == "/vi/abc123XYZ90/maxresdefault.jpg" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write([]byte("\xff\xd8\xff\xe0hqbytes"))
-	}))
-	defer srv.Close()
-
-	f := &ThumbnailFetcher{baseURL: srv.URL}
-	data, err := f.Fetch(context.Background(), "https://youtu.be/abc123XYZ90")
-	if err != nil {
-		t.Fatalf("Fetch() error = %v, want nil", err)
-	}
-	if string(data) != "\xff\xd8\xff\xe0hqbytes" {
-		t.Errorf("Fetch() = %q, want the hq fallback bytes", data)
-	}
-	if len(gotPaths) != 2 {
-		t.Fatalf("requested paths = %v, want maxres attempted then hq fallback", gotPaths)
-	}
-	if gotPaths[1] != "/vi/abc123XYZ90/hqdefault.jpg" {
-		t.Errorf("second request path = %q, want hqdefault.jpg", gotPaths[1])
-	}
-}
-
-func TestThumbnailFetcherReturnsNilWithoutAnExtractableVideoID(t *testing.T) {
-	f := &ThumbnailFetcher{baseURL: "http://should-not-be-contacted.invalid"}
-	data, err := f.Fetch(context.Background(), "https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx")
-	if err != nil {
-		t.Fatalf("Fetch() error = %v, want nil", err)
-	}
-	if data != nil {
-		t.Errorf("Fetch() = %v, want nil for a URL with no video ID", data)
-	}
-}
-
-func TestThumbnailFetcherReturnsNilWhenBothSizesAre404(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	defer srv.Close()
-
-	f := &ThumbnailFetcher{baseURL: srv.URL}
-	data, err := f.Fetch(context.Background(), "https://youtu.be/abc123XYZ90")
-	if err != nil {
-		t.Fatalf("Fetch() error = %v, want nil (a 404 is a confirmed miss, not an error)", err)
-	}
-	if data != nil {
-		t.Errorf("Fetch() = %v, want nil when neither size exists", data)
 	}
 }
