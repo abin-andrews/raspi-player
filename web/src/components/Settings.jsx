@@ -73,10 +73,13 @@ const SECTIONS = [
 // text — the backend rejects anything else anyway (internal/api's
 // validateOLED/validateBucket), so offering only valid choices avoids a
 // round-trip just to find out a typed value was rejected.
-function Settings({ downloads = [], jobs = [] }) {
-  // Which sidebar section is showing — persisted like Library's own view
-  // state, so reopening Settings lands back where you left it.
-  const [section, setSection] = useLocalStorageState('settings.section', 'general')
+function Settings({ downloads = [], jobs = [], section, onSectionChange }) {
+  // Which sidebar section is showing — now a route (App.jsx's
+  // useAppRoute, "#/<tab>/settings/<section>"), not local component
+  // state: reloading or sharing a link to a specific section (e.g.
+  // "#/library/settings/oled") lands there directly, not just wherever
+  // localStorage last remembered.
+  const setSection = onSectionChange
 
   // Same key/hook Library.jsx's own grid/list toggle uses — this control
   // and that one are two entry points to the one persisted preference, not

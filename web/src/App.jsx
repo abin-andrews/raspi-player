@@ -15,7 +15,7 @@ import {
 import { IconBooks, IconDownload, IconLoader2, IconPlaylist, IconSettings } from '@tabler/icons-react'
 import { getConfig } from './api.js'
 import { useDaemonSocket } from './hooks/useDaemonSocket.js'
-import { useHashTab } from './hooks/useHashTab.js'
+import { useAppRoute } from './hooks/useAppRoute.js'
 import Queue from './components/Queue.jsx'
 import Library from './components/Library.jsx'
 import Settings from './components/Settings.jsx'
@@ -34,14 +34,13 @@ import NowPlayingScreen from './components/NowPlayingScreen.jsx'
 // primary destination that deserves equal billing with Library/Queue in
 // the main nav — freeing that slot is what made top-middle tabs fit at
 // all.
-const TABS = ['library', 'queue']
-
 function App() {
   const { status, downloads, jobs, ready, error } = useDaemonSocket()
   const runningJobs = jobs.filter((j) => j.status === 'running')
-  const [tab, setTab] = useHashTab(TABS, 'library')
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const [nowPlayingOpen, setNowPlayingOpen] = useState(false)
+  const { tab, overlay, section, setTab, openSettings, setSettingsSection, openNowPlaying, closeOverlay } =
+    useAppRoute()
+  const settingsOpen = overlay === 'settings'
+  const nowPlayingOpen = overlay === 'now-playing'
 
   // The daemon's own config (currently just ui.hideVolumeControl is read
   // here) — fetched once up front, and again whenever Settings closes,
@@ -62,7 +61,7 @@ function App() {
   }, [])
 
   function closeSettings() {
-    setSettingsOpen(false)
+    closeOverlay()
     refreshUiConfig()
   }
 
@@ -140,7 +139,7 @@ function App() {
               <ActionIcon
                 variant="subtle"
                 size="lg"
-                onClick={() => setSettingsOpen(true)}
+                onClick={() => openSettings()}
                 aria-label="Settings"
               >
                 <IconSettings size={20} />
@@ -170,7 +169,7 @@ function App() {
         <AppShell.Footer>
           <PlayerBar
             status={status}
-            onExpand={() => setNowPlayingOpen(true)}
+            onExpand={openNowPlaying}
             hideVolumeControl={uiConfig.hideVolumeControl}
           />
         </AppShell.Footer>
@@ -183,7 +182,12 @@ function App() {
         fullScreen
         transitionProps={{ transition: 'slide-left' }}
       >
-        <Settings downloads={downloads} jobs={jobs} />
+        <Settings
+          downloads={downloads}
+          jobs={jobs}
+          section={section || 'general'}
+          onSectionChange={setSettingsSection}
+        />
       </Modal>
 
       {/* No title/close-button chrome — NowPlayingScreen provides its own
@@ -191,14 +195,14 @@ function App() {
           full-screen look rather than a generic modal dialog. */}
       <Modal
         opened={nowPlayingOpen}
-        onClose={() => setNowPlayingOpen(false)}
+        onClose={closeOverlay}
         fullScreen
         withCloseButton={false}
         transitionProps={{ transition: 'slide-up' }}
       >
         <NowPlayingScreen
           status={status}
-          onClose={() => setNowPlayingOpen(false)}
+          onClose={closeOverlay}
           hideVolumeControl={uiConfig.hideVolumeControl}
         />
       </Modal>

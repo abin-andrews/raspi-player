@@ -458,7 +458,11 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   confidence-lacking boolean. Both probing and the trackInfo lookup are best-effort per entry — a failure on
   either one only leaves that entry's corresponding fields zero-valued, never fails the whole listing.
   `Bucket.jsx`'s `formatAudioInfo` renders these as a compact "MP3 · 320 kbps · 44.1 kHz · 2ch" badge per
-  row.
+  row. **`Bucket.jsx` shows a loading indicator while the listing is in flight** (a `Loader` next to the
+  "Bucket Cache" title on every `refresh()`, plus a dedicated "Loading cached files…" placeholder in place
+  of the entry list specifically for the first load) — added once `List` started shelling out to `ffprobe`
+  per entry, which made `GET /api/bucket/list` take a genuinely noticeable moment for a library with many
+  cached files, not the near-instant response it was before this enrichment existed.
   **`player.Resolver.Unresolve` — mpd only ever sees the resolved URI, never the original**: confirmed by
   direct testing (see below) that a bucket-mode-resolved local file-server URL, once handed to mpd, becomes
   what mpd itself reports back through `Queue()`/`Status()` — so without reversing it, the Queue tab would show
@@ -835,6 +839,40 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   larger-breakpoint column counts (`cols={{ base: 2, sm: 3, md: 4, lg: 5, xl: 6 }}`, up from capping at 4)
   so a wider container also means more tiles per row, not just bigger gutters. Settings isn't affected —
   it's a separate full-screen `Modal`, not nested inside this `Container` at all.
+  **Grid tiles are full-bleed "poster" cards, and art actually scales with the tile** — reported directly
+  as wasted space: `TrackArt`'s `size` prop now also accepts the string `'100%'` (fills the parent's
+  width at a square aspect ratio via CSS `aspect-ratio`, not a fixed pixel box) instead of only a fixed
+  pixel number, so the art scales up with the grid cell's real width (more columns, a wider `Container`)
+  instead of sitting at a small fixed size with empty space around it. `LibraryEntryGridCard.jsx` and the
+  Albums/Artists entity-index cards (`Library.jsx`) both redesigned around this: art fills the entire
+  `Card` (`padding={0}`, `overflow: 'hidden'`), with a `linear-gradient(transparent 45%, rgba(0,0,0,0.85)
+  100%)` scrim and the title/artist/album text absolutely positioned over the bottom of the image in white
+  — the media-app "poster tile" look (Spotify/Apple Music-style), not a thumbnail with text below it. The
+  gradient (not a flat scrim) is what keeps the badge/menu sitting on the *top* of the tile fully visible
+  while still giving the bottom-anchored text contrast against whatever the underlying image looks like.
+  **`TrackArt`'s `radius` prop accepts `0`/`'0'` for exactly this case** (the poster tile wants only the
+  `Card`'s own rounding, not a second, possibly-mismatched radius on the image itself) — needed a real
+  fix, not just passing `0`: the existing code built `var(--mantine-radius-${radius})`, and
+  `var(--mantine-radius-0)` isn't a real custom property, so an unhandled `0` would make the whole
+  `border-radius` declaration invalid rather than reliably resolving to zero.
+  **YouTube's `hqdefault.jpg`/`sddefault.jpg` have a fixed, structural black bar — not per-video
+  letterboxing** — reported and initially mis-fixed: these two specific thumbnail sizes (unlike
+  `mqdefault.jpg`/`maxresdefault.jpg`) are always rendered onto a 4:3 canvas with the actual 16:9 video
+  frame centered inside it, i.e. an exact, always-the-same 12.5%-top/12.5%-bottom black bar for any normal
+  widescreen video — a well-known YouTube thumbnail quirk, confirmed here empirically (still visible after
+  a first attempt using a generic guessed zoom factor, `scale(1.3)`, which was close but not the exact
+  value). `object-fit: cover` inside a *square* box never touches this on its own: scaling a 4:3 source to
+  cover a square only ever needs to crop the sides — the height already lands exactly on the box's height
+  with zero scaling headroom left to crop away — so the bars show straight through untouched regardless of
+  the target box's shape. The fix is an *exact* scale, not a guessed one: `TrackArt.jsx`'s `debarYouTube`
+  applies `scale(1.3334)` (exactly 4/3) — enough to make the true 16:9 content fill the box vertically with
+  no leftover crop math, applied only when the image is reached via `resolve()`'s `GET /api/albumart` path
+  (always `hqdefault.jpg` for YouTube — see the album-art architecture note above), never via the batched
+  query's already-bar-free `resolvedPath` (always `mqdefault.jpg`, a genuine 16:9 canvas). `PlayerBar.jsx`
+  and `NowPlayingScreen.jsx` needed the identical fix independently — they render their own `<img>` tags
+  directly rather than going through `TrackArt` at all, so the first pass at this (scoped only to
+  `TrackArt`) never reached them, which is what a follow-up report of "still not cut off in some cases"
+  turned out to mean.
 - **Full-screen Now Playing view** (`web/src/components/NowPlayingScreen.jsx`, `web/src/hooks/
   usePlayerControls.js`) — `PlayerBar`'s mini bar is deliberately compact (art/title/artist truncated to
   fit a 80px footer), which is fine for "what's playing at a glance" but not for actually looking at the
@@ -906,11 +944,21 @@ extension/               A Manifest V3 Chrome extension ("Pi Streamer Remote"): 
   test (`mpc add`+`mpc play` against a deliberately 4s-delayed stream, status polled concurrently from a
   separate connection) confirmed mpd's own `add`/`play` return immediately and don't block other connections;
   `GompdClient`'s per-call mutex was never the bottleneck here.
-- **Hash-based tab routing** (`web/src/hooks/useHashTab.js`): the active `Tabs` value is synced to
-  `location.hash` (e.g. `#/queue`) instead of local-only `useState`, so a reload or browser back/forward keeps
-  your place. Deliberately hash-based, not real paths with a router library: a hash fragment is never sent to
-  the server, so `cmd/pi-streamer`'s static `http.FileServer` needs no "SPA fallback" route change for a hard
-  refresh on a given tab to keep working — real paths would have needed exactly that.
+- **Unified hash-based routing covers the tab *and* whatever's open on top of it**
+  (`web/src/hooks/useAppRoute.js`, replacing an earlier `useHashTab.js` that only tracked the active `Tabs`
+  value) — reloading while Settings or the full-screen Now Playing view was open used to always land back
+  on the Library tab with both closed, since neither's `open` state was anything but plain `useState`.
+  Hash shape: `#/<tab>` (`library`/`queue`, as before), `#/<tab>/settings/<section>` (`general`/`oled`/
+  `cache`), or `#/<tab>/now-playing` — the tab is always the first segment, even while an overlay is open
+  on top of it, specifically so closing the overlay knows which tab to land back on without needing a
+  second, unsynced piece of state for that. `App.jsx`'s `settingsOpen`/`nowPlayingOpen` are now just
+  `overlay === 'settings'`/`'now-playing'` computed from the route rather than their own state, and
+  `Settings.jsx`'s sidebar section is now a `section`/`onSectionChange` prop driven by the same route
+  instead of its own `useLocalStorageState` — reopening Settings, sharing a link to a specific section
+  (e.g. `#/library/settings/oled`), or hitting browser back after switching sections all now do the right
+  thing. Still deliberately hash-based, not real paths with a router library, for the same reason as
+  before: a hash fragment is never sent to the server, so `cmd/pi-streamer`'s static `http.FileServer`
+  needs no "SPA fallback" route change for a hard refresh on any of these to keep working.
 - **Library's search query, sub-view pill, and grid/list toggle persist across reloads** (`web/src/hooks/
   useLocalStorageState.js`) — a small `[value, setValue]` hook with the same shape/functional-update
   support as `useState` (so it drops in as a replacement) but backed by `localStorage`, read once via a

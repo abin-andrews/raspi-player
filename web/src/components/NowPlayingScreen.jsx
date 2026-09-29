@@ -59,20 +59,37 @@ function NowPlayingScreen({ status, onClose, hideVolumeControl }) {
 
       <Stack align="center" gap="md" style={{ flex: 1 }} justify="center">
         {showArt ? (
-          <img
-            src={albumArtUrl(status.song)}
-            onError={() => setArtFailed(true)}
-            alt="Album art"
+          <div
             style={{
               width: ART_SIZE,
               height: ART_SIZE,
               maxWidth: '80vw',
               maxHeight: '40vh',
-              objectFit: 'cover',
+              overflow: 'hidden',
               borderRadius: 12,
               boxShadow: 'var(--mantine-shadow-lg)',
             }}
-          />
+          >
+            <img
+              src={albumArtUrl(status.song)}
+              onError={() => setArtFailed(true)}
+              alt="Album art"
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'block',
+                objectFit: 'cover',
+                // This always goes through GET /api/albumart (resolve()),
+                // never the batched query's mqdefault.jpg path — so for a
+                // YouTube track it's always hqdefault.jpg, which has a
+                // fixed, structural 12.5%-top/bottom black bar (a 4:3
+                // canvas with 16:9 content centered inside it — see
+                // TrackArt.jsx's identical fix for the full explanation).
+                // Scaling by exactly 4/3 crops precisely that bar away.
+                transform: isYouTubeUrl(status?.song) ? 'scale(1.3334)' : undefined,
+              }}
+            />
+          </div>
         ) : (
           <ThemeIcon
             variant="light"

@@ -56,7 +56,6 @@ import History from './History.jsx'
 
 const PAGE_SIZE = 25
 const SEARCH_LIMIT = 50
-const ENTITY_ART_SIZE = 100
 const EMPTY_FORM = { url: '', title: '', artist: '', album: '', tags: '' }
 
 const SUB_VIEWS = [
@@ -476,7 +475,7 @@ function Library({ status }) {
             label={entry.album || entry.title || entry.url}
             artist={entry.artist}
             album={entry.album}
-            size={160}
+            size={220}
           />
           <Stack gap={6} style={{ minWidth: 0, flex: 1 }}>
             <Text fw={700} size="lg" truncate="end">
@@ -593,22 +592,32 @@ function Library({ status }) {
               <Card
                 key={name}
                 withBorder
-                padding="xs"
+                padding={0}
+                radius="md"
                 onClick={() => openEntity(name)}
-                style={{ cursor: 'pointer' }}
+                style={{ cursor: 'pointer', overflow: 'hidden', position: 'relative' }}
               >
-                <Stack gap={4} align="center">
-                  <TrackArt
-                    url={type === 'album' ? list[0]?.url : undefined}
-                    label={name}
-                    artist={type === 'album' ? list[0]?.artist : name}
-                    album={type === 'album' ? name : undefined}
-                    size={ENTITY_ART_SIZE}
-                  />
-                  <Text size="sm" fw={500} truncate="end" w="100%" ta="center">
+                <TrackArt
+                  url={type === 'album' ? list[0]?.url : undefined}
+                  label={name}
+                  artist={type === 'album' ? list[0]?.artist : name}
+                  album={type === 'album' ? name : undefined}
+                  size="100%"
+                  radius={0}
+                />
+                <div
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    background: 'linear-gradient(to bottom, transparent 45%, rgba(0, 0, 0, 0.85) 100%)',
+                    pointerEvents: 'none',
+                  }}
+                />
+                <Stack gap={0} style={{ position: 'absolute', left: 8, right: 8, bottom: 8 }}>
+                  <Text size="sm" fw={600} c="white" truncate="end">
                     {name}
                   </Text>
-                  <Text size="xs" c="dimmed">
+                  <Text size="xs" c="gray.3">
                     {list.length} track{list.length === 1 ? '' : 's'}
                   </Text>
                 </Stack>

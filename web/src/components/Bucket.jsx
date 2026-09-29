@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react'
-import { ActionIcon, Alert, Badge, Card, Group, Progress, Stack, Text, Title } from '@mantine/core'
+import { ActionIcon, Alert, Badge, Card, Group, Loader, Progress, Stack, Text, Title } from '@mantine/core'
 import { IconDownload, IconHeart, IconHeartFilled, IconTrash } from '@tabler/icons-react'
 import { addFavorite, getBucketList, listFavorites, removeBucketEntry, removeFavorite } from '../api.js'
 import { formatBytes, formatTime } from '../format.js'
@@ -39,15 +39,28 @@ function Bucket({ downloads = [] }) {
   const [favoriteUrls, setFavoriteUrls] = useState(new Set())
   const [error, setError] = useState(null)
   const [pending, setPending] = useState(null)
+  // Starts true (there's always at least one fetch before anything can
+  // render) rather than false-then-immediately-true, so the very first
+  // paint already shows the loading state instead of a one-frame flash of
+  // "Bucket is empty" before the real list arrives. Every refresh() call
+  // (not just the first) sets it again — the daemon now probes each
+  // cached file with ffprobe to enrich the listing (see
+  // internal/audioinfo), so GET /api/bucket/list can take a genuinely
+  // noticeable moment for a library with many cached files, not just on
+  // first load.
+  const [loading, setLoading] = useState(true)
   const wasDownloading = useRef(false)
 
   async function refresh() {
+    setLoading(true)
     try {
       const [list, favs] = await Promise.all([getBucketList(), listFavorites()])
       setEntries(list ?? [])
       setFavoriteUrls(new Set((favs ?? []).map((f) => f.url)))
     } catch (err) {
       setError(err.message)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -109,7 +122,10 @@ function Bucket({ downloads = [] }) {
         </Alert>
       )}
 
-      <Title order={5}>Bucket Cache</Title>
+      <Group gap="xs">
+        <Title order={5}>Bucket Cache</Title>
+        {loading && <Loader size="xs" />}
+      </Group>
       <Text size="sm" c="dimmed">
         Files currently downloaded in the evictable playback cache (see the Settings tab to
         change its size limit or switch modes). Favoriting a track here saves a separate,
@@ -143,7 +159,15 @@ function Bucket({ downloads = [] }) {
       )}
 
       <Stack gap="xs">
-        {entries.length === 0 && (
+        {loading && entries.length === 0 && (
+          <Group justify="center" py="md" gap="xs">
+            <Loader size="sm" />
+            <Text c="dimmed" size="sm">
+              Loading cached files…
+            </Text>
+          </Group>
+        )}
+        {!loading && entries.length === 0 && (
           <Text c="dimmed" size="sm">
             Bucket is empty — nothing's been downloaded yet (or the daemon is in "Stream
             directly" mode).

@@ -13,6 +13,7 @@ import {
 } from '@tabler/icons-react'
 import { formatTime } from '../format.js'
 import { albumArtUrl } from '../api.js'
+import { isYouTubeUrl } from '../isYouTubeUrl.js'
 import { usePlayerControls } from '../hooks/usePlayerControls.js'
 
 const ART_SIZE = 48
@@ -57,18 +58,23 @@ function PlayerBar({ status, onExpand, hideVolumeControl }) {
         aria-label={onExpand ? 'Open now playing' : undefined}
       >
         {showArt ? (
-          <img
-            src={albumArtUrl(status.song)}
-            onError={() => setArtFailed(true)}
-            alt="Album art"
-            style={{
-              width: ART_SIZE,
-              height: ART_SIZE,
-              objectFit: 'cover',
-              borderRadius: 6,
-              flexShrink: 0,
-            }}
-          />
+          <div style={{ width: ART_SIZE, height: ART_SIZE, overflow: 'hidden', borderRadius: 6, flexShrink: 0 }}>
+            <img
+              src={albumArtUrl(status.song)}
+              onError={() => setArtFailed(true)}
+              alt="Album art"
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'block',
+                objectFit: 'cover',
+                // Always resolve()'s hqdefault.jpg for a YouTube track (a
+                // fixed 4:3-canvas/16:9-content quirk, not per-video
+                // letterboxing) — see TrackArt.jsx's identical fix.
+                transform: isYouTubeUrl(status.song) ? 'scale(1.3334)' : undefined,
+              }}
+            />
+          </div>
         ) : (
           <ThemeIcon
             variant="light"
